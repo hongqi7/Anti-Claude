@@ -293,13 +293,49 @@ body[data-agy-theme][data-newux-theme="onyx"] .surface-composer > .surface-compo
 body[data-agy-theme][data-newux-theme="onyx"] .surface-composer:focus-within > .surface-composer-card,
 #antigravity\.agentSidePanelInputBox .surface-composer-card,
 #antigravity\.agentSidePanelInputBox:focus-within .surface-composer-card,
-#antigravity\.agentSidePanelInputBox > div.bg-card,
+#antigravity\.agentSidePanelInputBox > div.bg-card:not([data-mention-menu]):not([role="listbox"]),
 .surface-composer > .surface-composer-card,
 .surface-composer-card.bg-card {
   background-color: transparent !important;
   border: none !important;
   border-color: transparent !important;
   box-shadow: none !important;
+}
+
+/* 3.1b Restore solid opaque card & text hierarchy for / and @ typeahead menus portaled into composer */
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) #antigravity\.agentSidePanelInputBox > [data-mention-menu],
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) [data-mention-menu] {
+  background-color: #FFFFFF !important;
+  border: 1px solid #E6E6E4 !important;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.10), 0 2px 6px rgba(0, 0, 0, 0.04) !important;
+  color: #191918 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) #antigravity\.agentSidePanelInputBox > [data-mention-menu],
+:is(html[data-ag-theme-mode="dark"] body, body.dark) [data-mention-menu] {
+  background-color: #252523 !important;
+  border: 1px solid rgba(255, 255, 255, 0.11) !important;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.44) !important;
+  color: #ECECEA !important;
+}
+
+/* 4x ID specificity outranks upstream core/theme.css rule using :not(#ag-live-metrics-pill) (3-ID specificity) */
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) #antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox [data-mention-menu] [data-testid="menu-option-label"] {
+  color: #191918 !important;
+  font-weight: 500 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) #antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox [data-mention-menu] [data-testid="menu-option-label"] {
+  color: #ECECEA !important;
+  font-weight: 500 !important;
+}
+
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) #antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox [data-mention-menu] :is([data-testid="menu-option-description"], [data-testid="menu-option-trailing-label"], [data-testid="mention-menu-searching-row"], [data-testid="mention-menu-searching-row"] span, [data-testid="mention-menu-footer"], [data-testid="mention-menu-footer"] span, .text-secondary-foreground, .text-secondary-foreground svg) {
+  color: #787774 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) #antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox#antigravity\.agentSidePanelInputBox [data-mention-menu] :is([data-testid="menu-option-description"], [data-testid="menu-option-trailing-label"], [data-testid="mention-menu-searching-row"], [data-testid="mention-menu-searching-row"] span, [data-testid="mention-menu-footer"], [data-testid="mention-menu-footer"] span, .text-secondary-foreground, .text-secondary-foreground svg) {
+  color: #9A9994 !important;
 }
 
 /* 3.2 Composer footer controls & 100% unified sans-serif metrics pill (12.5px, warm gray) */
