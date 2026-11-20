@@ -15,6 +15,11 @@
   const CFG_ROOT = (typeof ctx !== 'undefined' && ctx && (ctx.config || ctx)) || {};
   const MODS =
     (typeof ctx !== 'undefined' && ctx && (ctx.modules || (ctx.config && ctx.config.modules))) || {};
+  const CFG_UI_STATE =
+    CFG_ROOT.uiState && typeof CFG_ROOT.uiState === 'object' && !Array.isArray(CFG_ROOT.uiState)
+      ? CFG_ROOT.uiState
+      : {};
+  const cfgUiPrefsTs = Number(CFG_ROOT.uiPrefsUpdatedAt) > 0 ? Number(CFG_ROOT.uiPrefsUpdatedAt) : 0;
   const MODULE_STORAGE_KEY = 'ag_claude_ux_modules_v1';
   const VALID_CJK_SCALES = ['94.5', '95', '100'];
   function normalizeCjkScale(v) {
@@ -30,7 +35,25 @@
       return {};
     }
   }
-  let localModOverrides = loadLocalModuleOverrides();
+  const rawLocalModOverrides = loadLocalModuleOverrides();
+  const localOverrideTs = Number(rawLocalModOverrides._ts) > 0 ? Number(rawLocalModOverrides._ts) : 0;
+  /* Trust localStorage overrides when daemon has never saved ui-prefs yet (migrates pre-existing in-session toggles)
+     or when localStorage carries a newer/equal timestamp; discard stale overrides from reused ephemeral ports. */
+  const trustLocalOverrides = cfgUiPrefsTs === 0 || localOverrideTs >= cfgUiPrefsTs;
+  let localModOverrides = trustLocalOverrides ? rawLocalModOverrides : {};
+  if (!trustLocalOverrides) {
+    try {
+      if (typeof localStorage === 'object' && localStorage) {
+        localStorage.removeItem(MODULE_STORAGE_KEY);
+        localStorage.removeItem('ag_claude_ux_recent_collapsed');
+        localStorage.removeItem('ag_claude_ux_unified_recents_collapsed');
+      }
+    } catch {}
+  }
+  const needsInitialPrefsSync =
+    trustLocalOverrides &&
+    ((cfgUiPrefsTs === 0 && Object.keys(localModOverrides).some((k) => k !== '_ts')) ||
+      (cfgUiPrefsTs > 0 && localOverrideTs > cfgUiPrefsTs));
   let currentCjkScale =
     normalizeCjkScale(localModOverrides.cjkFontScale) ||
     normalizeCjkScale(CFG_ROOT.cjkFontScale) ||
@@ -4087,17 +4110,21 @@
   let recentItemsById = new Map();
   let recentCollapsed = (() => {
     try {
-      return typeof localStorage === 'object' && localStorage && localStorage.getItem('ag_claude_ux_recent_collapsed') === '1';
-    } catch {
-      return false;
-    }
+      if (trustLocalOverrides && typeof localStorage === 'object' && localStorage) {
+        const v = localStorage.getItem('ag_claude_ux_recent_collapsed');
+        if (v === '1' || v === '0') return v === '1';
+      }
+    } catch {}
+    return Boolean(CFG_UI_STATE.recentCollapsed);
   })();
   let unifiedRecentCollapsed = (() => {
     try {
-      return typeof localStorage === 'object' && localStorage && localStorage.getItem('ag_claude_ux_unified_recents_collapsed') === '1';
-    } catch {
-      return false;
-    }
+      if (trustLocalOverrides && typeof localStorage === 'object' && localStorage) {
+        const v = localStorage.getItem('ag_claude_ux_unified_recents_collapsed');
+        if (v === '1' || v === '0') return v === '1';
+      }
+    } catch {}
+    return Boolean(CFG_UI_STATE.unifiedRecentCollapsed);
   })();
 
   function protoSeconds(ts) {
@@ -4835,6 +4862,7 @@
               localStorage.setItem('ag_claude_ux_recent_collapsed', recentCollapsed ? '1' : '0');
             } catch {}
           }
+          persistUiPrefsToDaemon();
           recentLastSig = '';
           syncSidebarEnhancements();
           return;
@@ -5659,14 +5687,53 @@
     }, 1400);
   }
 
+  let prefsSyncRetryTimer = 0;
+  function persistUiPrefsToDaemon(explicitTs = 0) {
+    const updatedAt = explicitTs > 0 ? explicitTs : Date.now();
+    localModOverrides._ts = updatedAt;
+    try {
+      if (typeof localStorage === 'object' && localStorage) {
+        localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(localModOverrides));
+      }
+    } catch {}
+    if (typeof window.__agProjectCall !== 'function') return;
+    const modulesPayload = {};
+    for (const grp of SETTINGS_GROUPS) {
+      for (const [modKey, featKey] of grp.items) {
+        modulesPayload[modKey] = Boolean(FEAT[featKey]);
+      }
+    }
+    const reqPayload = {
+      updatedAt,
+      modules: modulesPayload,
+      cjkFontScale: currentCjkScale,
+      uiState: {
+        recentCollapsed: Boolean(recentCollapsed),
+        unifiedRecentCollapsed: Boolean(unifiedRecentCollapsed)
+      }
+    };
+    window
+      .__agProjectCall('saveUiPrefs', reqPayload, 5000)
+      .then((res) => {
+        if (disposed) return;
+        if (!res || !res.ok) {
+          cancelLater(prefsSyncRetryTimer);
+          prefsSyncRetryTimer = later(() => {
+            if (!disposed && typeof window.__agProjectCall === 'function') {
+              window.__agProjectCall('saveUiPrefs', reqPayload, 5000).catch(() => {});
+            }
+          }, 450);
+        }
+      })
+      .catch(() => {});
+  }
+
   function setCjkScaleOverride(rawScale) {
     const next = normalizeCjkScale(rawScale);
     if (!next) return;
     currentCjkScale = next;
     localModOverrides.cjkFontScale = next;
-    try {
-      localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(localModOverrides));
-    } catch {}
+    persistUiPrefsToDaemon();
     if (docRoot) {
       docRoot.setAttribute('data-ag-cjk-scale', next);
     }
@@ -5676,10 +5743,8 @@
 
   function setModuleOverride(modKey, featKey, nextBool) {
     localModOverrides[modKey] = Boolean(nextBool);
-    try {
-      localStorage.setItem(MODULE_STORAGE_KEY, JSON.stringify(localModOverrides));
-    } catch {}
     FEAT[featKey] = Boolean(nextBool);
+    persistUiPrefsToDaemon();
     applyImmediateFeatureEffects(featKey, FEAT[featKey]);
     syncSettingsSwitchesUi();
     flashSettingsSavedToast();
@@ -9680,6 +9745,39 @@
   }
 
   let sidebarHideScrollEl = null;
+  let sidebarListLayoutMo = null;
+  let sidebarListLayoutTarget = null;
+
+  function syncPinnedSidebarRowTooltips(root) {
+    const scope = root || document;
+    const rows = scope.querySelectorAll('[data-testid="conversation-row-sidebar"][data-pinned="true"][data-subtext]');
+    for (const row of rows) {
+      const subtext = String(row.getAttribute('data-subtext') || '').trim();
+      const link = row.querySelector('a[href]');
+      if (!subtext) {
+        if (link && link.getAttribute('data-ag-pin-tip') === '1') {
+          link.removeAttribute('title');
+          link.removeAttribute('data-ag-pin-tip');
+        }
+        continue;
+      }
+      const titleSpan = row.querySelector('.flex-col > span');
+      const baseTitle = String((link && link.getAttribute('aria-label')) || (titleSpan && titleSpan.textContent) || '').trim();
+      const tip = baseTitle ? `${baseTitle}\n${L('所属项目：', 'Project: ')}${subtext}` : `${L('所属项目：', 'Project: ')}${subtext}`;
+      const target = link || row;
+      if (target.getAttribute('title') !== tip) {
+        target.setAttribute('title', tip);
+        target.setAttribute('data-ag-pin-tip', '1');
+      }
+    }
+  }
+
+  function clearPinnedSidebarRowTooltips() {
+    document.querySelectorAll('[data-ag-pin-tip="1"]').forEach((el) => {
+      el.removeAttribute('title');
+      el.removeAttribute('data-ag-pin-tip');
+    });
+  }
 
   function parseVirtualTranslateY(el) {
     if (!el) return 0;
@@ -9693,6 +9791,13 @@
     if (sidebarHideScrollEl) {
       sidebarHideScrollEl.removeEventListener('scroll', onSidebarHideScroll);
       sidebarHideScrollEl = null;
+    }
+    if (sidebarListLayoutMo) {
+      try {
+        sidebarListLayoutMo.disconnect();
+      } catch {}
+      sidebarListLayoutMo = null;
+      sidebarListLayoutTarget = null;
     }
     const scrollBox = document.querySelector('[data-testid="conversation-list-sidebar"]');
     const { host: sbParent } = getSidebarListHost(scrollBox);
@@ -9723,11 +9828,14 @@
   }
 
   function syncSidebarHideNativeProjects() {
+    const scrollBox = document.querySelector('[data-testid="conversation-list-sidebar"]');
+    if (scrollBox && !disposed) {
+      syncPinnedSidebarRowTooltips(scrollBox);
+    }
     if (disposed || !FEAT.hideSidebarProjects) {
       clearSidebarHideNativeProjects();
       return;
     }
-    const scrollBox = document.querySelector('[data-testid="conversation-list-sidebar"]');
     const { host: sbParent } = getSidebarListHost(scrollBox);
     const list = scrollBox && scrollBox.firstElementChild;
     if (!scrollBox || !sbParent || !list) return;
@@ -9736,6 +9844,32 @@
       if (sidebarHideScrollEl) sidebarHideScrollEl.removeEventListener('scroll', onSidebarHideScroll);
       sidebarHideScrollEl = scrollBox;
       scrollBox.addEventListener('scroll', onSidebarHideScroll, { passive: true });
+    }
+    if (typeof MutationObserver !== 'undefined' && sidebarListLayoutTarget !== list) {
+      if (sidebarListLayoutMo) {
+        try {
+          sidebarListLayoutMo.disconnect();
+        } catch {}
+      }
+      sidebarListLayoutTarget = list;
+      sidebarListLayoutMo = new MutationObserver((muts) => {
+        if (disposed || !FEAT.hideSidebarProjects) return;
+        for (const m of muts) {
+          if (m.attributeName === 'data-subtext') {
+            syncPinnedSidebarRowTooltips(scrollBox);
+            return;
+          }
+          if (m.attributeName === 'style' && m.target && m.target.parentElement === list) {
+            syncSidebarHideNativeProjects();
+            return;
+          }
+        }
+      });
+      sidebarListLayoutMo.observe(list, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'data-subtext']
+      });
     }
     if (scrollBox.scrollTop > 0) {
       try {
@@ -10791,6 +10925,9 @@
       pendingBodyReadyCleanup = null;
     }
     applyUiI18nState(FEAT.i18n);
+    if (needsInitialPrefsSync) {
+      persistUiPrefsToDaemon(localOverrideTs || Date.now());
+    }
     observer.observe(document.body, {
       subtree: true,
       childList: true,
@@ -10917,6 +11054,8 @@
       });
     restoreInlinePillBoundaries();
     restoreLegacySidebarCjkNodes();
+    clearSidebarHideNativeProjects();
+    clearPinnedSidebarRowTooltips();
     if (docRoot && docRoot.getAttribute('lang') === 'zh-CN') {
       if (hadDocLang && origDocLang !== null) docRoot.setAttribute('lang', origDocLang);
       else docRoot.removeAttribute('lang');

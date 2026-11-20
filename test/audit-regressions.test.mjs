@@ -1632,3 +1632,171 @@ test('[Pinned History & Image Paste] Pinned conversations (excluded from indexes
     window.close();
   }
 });
+
+test('[Pinned Sidebar Single-Line] hides redundant project folder subtitle line in Pinned Conversations, exposes project on hover tooltip, and compacts --ag-sb-pinned-height on virtual translateY reflow', { skip: skipDom }, async () => {
+  const customCssSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.css'), 'utf8');
+  assert.match(
+    customCssSrc,
+    /\[data-testid="conversation-row-sidebar"\]\[data-pinned="true"\][\s\S]*?svg\[data-project-glyph\][\s\S]*?display:\s*none\s*!important/,
+    'custom.css hides redundant project folder subtitle line inside Pinned Conversations'
+  );
+
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div class="bg-sidebar">
+        <div data-testid="conversation-list-sidebar">
+          <div class="w-full relative" style="height: 220px;">
+            <div data-index="0" style="position: sticky; top: 0px;"><div data-testid="section-header">置顶对话</div></div>
+            <div data-index="1" style="position: absolute; transform: translateY(24px);">
+              <div data-testid="conversation-row-sidebar" data-pinned="true" data-subtext="技术（Antigravity）">
+                <a href="/c/c-pin-1" aria-label="Fix Bugs in Chat History"></a>
+                <div class="flex-col">
+                  <span>Fix Bugs in Chat History</span>
+                  <span><svg data-project-glyph="folder"></svg>技术（Antigravity）</span>
+                </div>
+              </div>
+            </div>
+            <div data-index="2" style="position: absolute; transform: translateY(159px);">
+              <div data-testid="section-header"><span>项目</span><button data-testid="sidebar-add-project-button"></button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </body></html>`,
+    { url: 'http://127.0.0.1/', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  window.ctx = { modules: { i18n: true, claudeUxHideSidebarProjects: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    const sb = doc.querySelector('[data-testid="conversation-list-sidebar"]');
+    const link = doc.querySelector('[data-testid="conversation-row-sidebar"] a[href]');
+    assert.equal(
+      link.getAttribute('title'),
+      'Fix Bugs in Chat History\n所属项目：技术（Antigravity）',
+      'preserves owning project name in hover tooltip'
+    );
+    assert.equal(sb.style.getPropertyValue('--ag-sb-pinned-height'), '159px');
+
+    /* Simulate TanStack Virtual ResizeObserver compacting translateY from 159px -> 139px after 2nd line hides */
+    doc.querySelector('[data-index="2"]').setAttribute('style', 'position: absolute; transform: translateY(139px);');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(
+      sb.style.getPropertyValue('--ag-sb-pinned-height'),
+      '139px',
+      'automatically shrinks --ag-sb-pinned-height when virtualizer compacts pinned row height'
+    );
+  } finally {
+    window.close();
+  }
+});
+
+test('[Language Persistence Across Ephemeral Port Restarts] persists Chinese/English UI mode & CJK scale to daemon ui-prefs.json across random 127.0.0.1:<port> restarts and discards stale reused-port localStorage', { skip: skipDom }, async () => {
+  const daemon = await import(pathToFileURL(path.join(REPO, 'core', 'daemon.mjs')).href);
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const uiPrefsPath = path.join(HERMETIC_DAEMON_STATE, 'ui-prefs.json');
+  const userDir = path.join(HERMETIC_DAEMON_STATE, 'user');
+  fs.mkdirSync(userDir, { recursive: true });
+  fs.copyFileSync(path.join(REPO, 'user', 'config.json'), path.join(userDir, 'config.json'));
+  fs.rmSync(uiPrefsPath, { force: true });
+
+  const openSimulatedWindow = (port, preseedLocalStorage = null) => {
+    daemon.rebuildBundleIfNeeded();
+    const boot = daemon.getCachedBootPayload();
+    const dom = new JSDOM(
+      `<!doctype html><html><body>
+        <div data-split-root="true">
+          <div>
+            <div data-testid="settings-sidebar">
+              <div class="flex flex-col gap-0.5">
+                <div class="group/nav-item"><button type="button" data-testid="settings-nav-item-General" class="bg-sidebar-secondary"><span>General</span></button></div>
+                <div class="group/nav-item"><button type="button" data-testid="settings-nav-item-Appearance"><span>Appearance</span></button></div>
+              </div>
+            </div>
+          </div>
+          <div>
+            <div id="settings-right-host"><div>Native Content</div></div>
+          </div>
+        </div>
+      </body></html>`,
+      { url: `https://127.0.0.1:${port}/`, pretendToBeVisual: true, runScripts: 'outside-only' }
+    );
+    const { window } = dom;
+    if (preseedLocalStorage) {
+      window.localStorage.setItem('ag_claude_ux_modules_v1', JSON.stringify(preseedLocalStorage));
+    }
+    window.__agProjectCall = async (action, payload) => {
+      if (action === 'saveUiPrefs') {
+        const res = daemon.saveUiPrefs(payload);
+        daemon.rebuildBundleIfNeeded();
+        return res;
+      }
+      return { ok: false, error: 'unsupported' };
+    };
+    window.ctx = {
+      config: boot.config,
+      modules: boot.modules,
+      dict: boot.dict,
+      onCleanup: () => {}
+    };
+    window.eval(customJsSrc);
+    return dom;
+  };
+
+  let dom1 = null;
+  let dom2 = null;
+  let dom3 = null;
+  let dom4 = null;
+  try {
+    /* 1. Boot on port 51016 with legacy unsynced localStorage { i18n: true } -> auto-migrates to ui-prefs.json */
+    dom1 = openSimulatedWindow(51016, { i18n: true, cjkFontScale: '94.5' });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(dom1.window.document.documentElement.getAttribute('data-ag-ux-lang'), 'zh');
+    assert.equal(dom1.window.document.documentElement.getAttribute('data-ag-cjk-scale'), '94.5');
+    assert.equal(fs.existsSync(uiPrefsPath), true, 'auto-migrates existing session localStorage to ui-prefs.json');
+    const saved1 = JSON.parse(fs.readFileSync(uiPrefsPath, 'utf8'));
+    assert.equal(saved1.modules.i18n, true);
+    assert.equal(saved1.cjkFontScale, '94.5');
+
+    /* 2. Simulate Antigravity restart on a brand-new ephemeral port 58432 (empty localStorage) -> stays Chinese! */
+    dom2 = openSimulatedWindow(58432);
+    assert.equal(
+      dom2.window.document.documentElement.getAttribute('data-ag-ux-lang'),
+      'zh',
+      'new random port restart keeps Chinese mode without resetting to English'
+    );
+    assert.equal(dom2.window.document.documentElement.getAttribute('data-ag-cjk-scale'), '94.5');
+
+    /* 3. User opens UI Enhancements on port 58432 and switches i18n OFF (back to English) */
+    const navBtn = dom2.window.document.querySelector('button[data-testid="settings-nav-item-ClaudeUX"]');
+    assert.ok(navBtn, 'mounts UI Enhancements settings nav button');
+    navBtn.click();
+    const i18nSwitch = dom2.window.document.querySelector('[data-ag-cux-switch="i18n"]');
+    assert.equal(i18nSwitch.getAttribute('aria-checked'), 'true');
+    i18nSwitch.click();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(dom2.window.document.documentElement.getAttribute('data-ag-ux-lang'), 'en');
+    const saved2 = JSON.parse(fs.readFileSync(uiPrefsPath, 'utf8'));
+    assert.equal(saved2.modules.i18n, false, 'persists English selection to disk');
+
+    /* 4. Restart on BOTH a new port (61200) AND a reused old port (51016 with stale _ts) -> both boot in English! */
+    dom3 = openSimulatedWindow(61200);
+    assert.equal(dom3.window.document.documentElement.getAttribute('data-ag-ux-lang'), 'en');
+
+    dom4 = openSimulatedWindow(51016, { i18n: true, _ts: saved1.updatedAt });
+    assert.equal(
+      dom4.window.document.documentElement.getAttribute('data-ag-ux-lang'),
+      'en',
+      'discards stale localStorage when OS reuses an older ephemeral port'
+    );
+  } finally {
+    if (dom1) dom1.window.close();
+    if (dom2) dom2.window.close();
+    if (dom3) dom3.window.close();
+    if (dom4) dom4.window.close();
+    fs.rmSync(uiPrefsPath, { force: true });
+  }
+});

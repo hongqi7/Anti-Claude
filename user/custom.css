@@ -2656,6 +2656,16 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-claude-folder-badge[da
   overflow: hidden !important;
 }
 
+/* 侧栏顶部「置顶对话」统一为单行紧凑行高：隐藏「📁 所属项目」第二行，保持与「最近对话」一致（悬停仍可看所属项目） */
+[data-testid="conversation-row-sidebar"][data-pinned="true"] {
+  align-items: center !important;
+}
+
+[data-testid="conversation-row-sidebar"][data-pinned="true"] span:has(> svg[data-project-glyph]),
+[data-testid="conversation-row-sidebar"][data-pinned="true"][data-subtext]:not([data-subtext=""]) .flex-col > span:nth-child(2) {
+  display: none !important;
+}
+
 [data-ag-sb-unified="empty"] {
   display: none !important;
 }

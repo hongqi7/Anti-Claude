@@ -48,6 +48,8 @@ const USER_DIR = path.resolve(
   resolveArgValue('--user-dir') || process.env.ANTI_CLAUDE_USER_DIR || path.join(STATE_DIR, 'user')
 );
 const PID_FILE = path.join(STATE_DIR, 'daemon.pid');
+const UI_PREFS_FILE = path.join(STATE_DIR, 'ui-prefs.json');
+const BASE_CONFIG_FILE = path.join(STATE_DIR, 'base', 'config.json');
 const CORE_BASE_CSS_FILE = path.join(__dirname, 'base.css');
 const CORE_I18N_FILE = path.join(__dirname, 'i18n.json');
 const CORE_RUNTIME_FILE = path.join(__dirname, 'runtime.js');
@@ -73,6 +75,29 @@ const GLOBAL_AGENTS_DIR = path.resolve(
 );
 const RESERVED_AGENT_NAMES = new Set(['self', 'browser', 'research', 'deepagent', 'review-agent', 'image-generator']);
 const ALLOWED_AGENT_TOOLS = ['read_file', 'edit_file', 'write_file', 'run_command', 'manage_task', 'search_web'];
+const ALLOWED_UI_MODULE_KEYS = new Set([
+  'i18n',
+  'metrics',
+  'composerWaxSeal',
+  'deadlockHealer',
+  'coldBootHealer',
+  'zoomShortcuts',
+  'customCss',
+  'customJs',
+  'claudeUxStepUnfold',
+  'claudeUxCollapseAnimation',
+  'claudeUxTodoCard',
+  'claudeUxRunningTimer',
+  'claudeUxContextRing',
+  'claudeUxModelMenu',
+  'claudeUxInlineUndo',
+  'claudeUxFolderStatus',
+  'claudeUxRecentSection',
+  'claudeUxProjects',
+  'claudeUxHideSidebarProjects',
+  'claudeUxCustomizations'
+]);
+const VALID_CJK_SCALES = new Set(['94.5', '95', '100']);
 const INLINE_TEXT_EXTS = new Set([
   '.md', '.markdown', '.txt', '.json', '.yaml', '.yml', '.toml', '.csv', '.tsv', '.xml',
   '.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.go',
@@ -601,6 +626,104 @@ let activeConfig = {
   endpoints: []
 };
 
+function sanitizeUiPrefs(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const modules = {};
+  if (raw.modules && typeof raw.modules === 'object' && !Array.isArray(raw.modules)) {
+    for (const [k, v] of Object.entries(raw.modules)) {
+      if (ALLOWED_UI_MODULE_KEYS.has(k) && typeof v === 'boolean') {
+        modules[k] = v;
+      }
+    }
+  }
+  const rawScale = String(raw.cjkFontScale ?? '').trim().replace(/%$/, '');
+  const cjkFontScale = VALID_CJK_SCALES.has(rawScale) ? rawScale : null;
+  const uiState = {};
+  if (raw.uiState && typeof raw.uiState === 'object' && !Array.isArray(raw.uiState)) {
+    if (typeof raw.uiState.recentCollapsed === 'boolean') {
+      uiState.recentCollapsed = raw.uiState.recentCollapsed;
+    }
+    if (typeof raw.uiState.unifiedRecentCollapsed === 'boolean') {
+      uiState.unifiedRecentCollapsed = raw.uiState.unifiedRecentCollapsed;
+    }
+  }
+  const updatedAt = Number(raw.updatedAt) > 0 ? Math.floor(Number(raw.updatedAt)) : 0;
+  return { modules, cjkFontScale, uiState, updatedAt };
+}
+
+function resolveEffectiveUserConfig(userConfigFile, rawCfg) {
+  const baseObj = rawCfg && typeof rawCfg === 'object' && !Array.isArray(rawCfg) ? rawCfg : {};
+  const prefs = sanitizeUiPrefs(readJsonOrFallback(UI_PREFS_FILE, null));
+  if (!prefs) return baseObj;
+
+  let manualConfigNewer = false;
+  if (prefs.updatedAt > 0) {
+    try {
+      const st = fs.statSync(userConfigFile, { throwIfNoEntry: false });
+      if (st && st.mtimeMs > prefs.updatedAt + 500) {
+        const userRaw = readTextOrEmpty(userConfigFile);
+        const baseRaw = readTextOrEmpty(BASE_CONFIG_FILE);
+        if (userRaw && userRaw !== baseRaw) {
+          manualConfigNewer = true;
+        }
+      }
+    } catch {}
+  }
+
+  const rawMods = baseObj.modules && typeof baseObj.modules === 'object' ? baseObj.modules : {};
+  const mergedModules = manualConfigNewer
+    ? Object.assign({}, prefs.modules, rawMods)
+    : Object.assign({}, rawMods, prefs.modules);
+  const mergedUiState = Object.assign(
+    {},
+    baseObj.uiState && typeof baseObj.uiState === 'object' ? baseObj.uiState : {},
+    prefs.uiState
+  );
+  const out = Object.assign({}, baseObj, {
+    modules: mergedModules,
+    uiState: mergedUiState,
+    uiPrefsUpdatedAt: prefs.updatedAt || Date.now()
+  });
+  if (prefs.cjkFontScale && (!manualConfigNewer || !baseObj.cjkFontScale)) {
+    out.cjkFontScale = prefs.cjkFontScale;
+  }
+  return out;
+}
+
+export function saveUiPrefs(payload) {
+  const cur = sanitizeUiPrefs(readJsonOrFallback(UI_PREFS_FILE, null)) || {
+    modules: {},
+    cjkFontScale: null,
+    uiState: {},
+    updatedAt: 0
+  };
+  const incoming = sanitizeUiPrefs(payload) || {
+    modules: {},
+    cjkFontScale: null,
+    uiState: {},
+    updatedAt: 0
+  };
+  const updatedAt = Math.max(Date.now(), cur.updatedAt + 1, incoming.updatedAt);
+  const next = {
+    schema: 1,
+    updatedAt,
+    modules: Object.assign({}, cur.modules, incoming.modules),
+    ...(incoming.cjkFontScale || cur.cjkFontScale
+      ? { cjkFontScale: incoming.cjkFontScale || cur.cjkFontScale }
+      : {}),
+    uiState: Object.assign({}, cur.uiState, incoming.uiState)
+  };
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  writeAtomicUtf8(UI_PREFS_FILE, `${JSON.stringify(next, null, 2)}\n`);
+  return {
+    ok: true,
+    updatedAt,
+    modules: next.modules,
+    cjkFontScale: next.cjkFontScale || null,
+    uiState: next.uiState
+  };
+}
+
 function rebuildBundleIfNeeded() {
   const userConfigFile = path.join(USER_DIR, 'config.json');
   const userCssFile = path.join(USER_DIR, 'custom.css');
@@ -613,6 +736,7 @@ function rebuildBundleIfNeeded() {
     statSig(CORE_I18N_FILE),
     statSig(CORE_RUNTIME_FILE),
     statSig(userConfigFile),
+    statSig(UI_PREFS_FILE),
     statSig(userCssFile),
     statSig(userJsFile),
     statSig(userI18nFile)
@@ -629,7 +753,8 @@ function rebuildBundleIfNeeded() {
   const pkg = readJsonOrFallback(PKG_FILE, {});
   cachedVersion = pkg?.version ? `anti-claude-${pkg.version}` : 'anti-claude-3.0.2';
 
-  const rawCfg = readJsonOrFallback(userConfigFile, {});
+  const diskCfg = readJsonOrFallback(userConfigFile, {});
+  const rawCfg = resolveEffectiveUserConfig(userConfigFile, diskCfg);
   const enabled = rawCfg?.enabled !== false;
   const modules = Object.assign(
     {
@@ -2246,7 +2371,7 @@ async function importLocalAgentNative() {
   return { ok: true, canceled: false, imported, dirPath: GLOBAL_AGENTS_DIR };
 }
 
-async function handleProjectRpcRequest(rawPayload) {
+async function handleProjectRpcRequest(rawPayload, callerEntry = null) {
   let req;
   try {
     req = JSON.parse(String(rawPayload || '{}'));
@@ -2259,6 +2384,21 @@ async function handleProjectRpcRequest(rawPayload) {
   if (!reqId || !action) return null;
 
   try {
+    if (action === 'saveUiPrefs') {
+      const res = saveUiPrefs(payload);
+      rebuildBundleIfNeeded();
+      if (callerEntry && callerEntry.hostConfirmed) {
+        callerEntry.injectedBundleHash = cachedBundleHash;
+        await callerEntry.updateNewDocScript().catch(() => {});
+      }
+      for (const [, other] of attachedTargets.entries()) {
+        if (other !== callerEntry && other.hostConfirmed) {
+          other.updateNewDocScript().catch(() => {});
+          other.checkAndInject(true).catch(() => {});
+        }
+      }
+      return { reqId, result: res };
+    }
     if (action === 'listContexts') {
       const paths = Array.isArray(payload.paths) ? payload.paths.slice(0, 80) : [];
       const projectIds = Array.isArray(payload.projectIds) ? payload.projectIds.slice(0, 120) : [];
@@ -2744,7 +2884,7 @@ export async function attachTarget(page, endpoint) {
         }
         const expectedContextId = entry.trustedContextId;
         const expectedToken = entry.rpcToken;
-        handleProjectRpcRequest(payload)
+        handleProjectRpcRequest(payload, entry)
           .then((reply) => {
             if (!reply || !entry.hostConfirmed || entry.rpcToken !== expectedToken || entry.trustedContextId !== expectedContextId) {
               return;
@@ -3017,7 +3157,11 @@ async function runVerifyOnce() {
   process.exit(ok ? 0 : 1);
 }
 
-export { attachedTargets, skippedNonHostTargets, sync, rebuildBundleIfNeeded };
+function getCachedBootPayload() {
+  return cachedBootPayloadBase;
+}
+
+export { attachedTargets, skippedNonHostTargets, sync, rebuildBundleIfNeeded, getCachedBootPayload };
 
 const isMainModule = (() => {
   try {
