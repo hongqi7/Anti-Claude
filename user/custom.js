@@ -3047,6 +3047,23 @@
     return { baseName, effort };
   }
 
+  function modelCoreRank(name) {
+    if (/carbon/i.test(name)) return 0;
+    if (/neon/i.test(name)) return 1;
+    if (/argon/i.test(name)) return 2;
+    if (/hydrogen/i.test(name)) return 3;
+    if (/flash/i.test(name)) return 4;
+    return 10;
+  }
+
+  function sortFamilyVariants(variants) {
+    return variants.sort((a, b) => {
+      const ra = a.effort && EFFORT_RANK[a.effort] !== undefined ? EFFORT_RANK[a.effort] : 99;
+      const rb = b.effort && EFFORT_RANK[b.effort] !== undefined ? EFFORT_RANK[b.effort] : 99;
+      return ra - rb;
+    });
+  }
+
   function matchPlannerFromTriggerText(rawText, planners) {
     let txt = String(rawText || '').trim().replace(/\s+/g, ' ');
     if (!txt) return null;
@@ -3370,11 +3387,7 @@
     }
 
     for (const fam of familyMap.values()) {
-      fam.variants.sort((a, b) => {
-        const ra = a.effort && EFFORT_RANK[a.effort] !== undefined ? EFFORT_RANK[a.effort] : 99;
-        const rb = b.effort && EFFORT_RANK[b.effort] !== undefined ? EFFORT_RANK[b.effort] : 99;
-        return ra - rb;
-      });
+      sortFamilyVariants(fam.variants);
     }
 
     const orchFamilies = [];
@@ -3391,11 +3404,7 @@
         fam.variants.push({ effort: parsed.effort, opt: canonicalOrchOpt, plannerOpt: p });
       }
       for (const fam of orchFamilyMap.values()) {
-        fam.variants.sort((a, b) => {
-          const ra = a.effort && EFFORT_RANK[a.effort] !== undefined ? EFFORT_RANK[a.effort] : 99;
-          const rb = b.effort && EFFORT_RANK[b.effort] !== undefined ? EFFORT_RANK[b.effort] : 99;
-          return ra - rb;
-        });
+        sortFamilyVariants(fam.variants);
         orchFamilies.push(fam);
       }
     }
@@ -3404,18 +3413,9 @@
     const isOrch = (f) => Boolean(f && (f.isOrchestratorFamily || /orchestrator/i.test(f.baseName)));
     const isCoreGemini = (f) => /^gemini\b/i.test(f.baseName) && !isOrch(f);
 
-    const coreRank = (name) => {
-      if (/carbon/i.test(name)) return 0;
-      if (/neon/i.test(name)) return 1;
-      if (/argon/i.test(name)) return 2;
-      if (/hydrogen/i.test(name)) return 3;
-      if (/flash/i.test(name)) return 4;
-      return 10;
-    };
-
     const primaryFamilies = families
       .filter(isCoreGemini)
-      .sort((a, b) => coreRank(a.baseName) - coreRank(b.baseName))
+      .sort((a, b) => modelCoreRank(a.baseName) - modelCoreRank(b.baseName))
       .slice(0, 5);
 
     const primarySet = new Set(primaryFamilies);
@@ -9190,19 +9190,58 @@
     );
   }
 
-  async function pickAndAddFilesToProject(project) {
-    if (!project || !project.dirPath || typeof window.__agProjectCall !== 'function') return;
-    const picked = await window.__agProjectCall('pickFiles', {}, 120000);
-    if (disposed || !picked || !picked.ok || !Array.isArray(picked.paths) || !picked.paths.length) return;
-    await saveFilesDeltaForProject(project, (ops) => {
-      const next = ops.slice();
-      for (const p of picked.paths) {
-        if (!next.some((x) => x.absPath === p || x.sourcePath === p)) {
-          next.push({ action: 'add', sourcePath: p, name: p.split(/[\\/]/).pop() || p });
+  function openInstantNativeFilePicker(project) {
+    if (!project || !project.dirPath || !document.body) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none';
+    document.body.appendChild(input);
+    const cleanup = () => {
+      try {
+        input.remove();
+      } catch {}
+    };
+    input.addEventListener(
+      'change',
+      () => {
+        const files = input.files;
+        cleanup();
+        if (!disposed && files && files.length) {
+          addDroppedFilesToProject(project, files);
         }
+      },
+      { once: true }
+    );
+    input.addEventListener('cancel', cleanup, { once: true });
+    input.click();
+  }
+
+  async function pickAndAddFilesToProject(project) {
+    if (!project || !project.dirPath) return;
+    const en = window.electronNative;
+    if (en && typeof en.getPathForFile === 'function') {
+      openInstantNativeFilePicker(project);
+      return;
+    }
+    if (typeof window.__agProjectCall === 'function') {
+      const picked = await window.__agProjectCall('pickFiles', {}, 120000);
+      if (disposed) return;
+      if (picked && picked.ok) {
+        if (!Array.isArray(picked.paths) || !picked.paths.length) return;
+        await saveFilesDeltaForProject(project, (ops) => {
+          const next = ops.slice();
+          for (const p of picked.paths) {
+            if (!next.some((x) => x.absPath === p || x.sourcePath === p)) {
+              next.push({ action: 'add', sourcePath: p, name: p.split(/[\\/]/).pop() || p });
+            }
+          }
+          return next;
+        });
+        return;
       }
-      return next;
-    });
+    }
+    openInstantNativeFilePicker(project);
   }
 
   async function addDroppedFilesToProject(project, fileList) {
@@ -9235,7 +9274,15 @@
       }
     }
     if (!additions.length) return;
-    await saveFilesDeltaForProject(project, (ops) => ops.concat(additions));
+    await saveFilesDeltaForProject(project, (ops) => {
+      const next = ops.slice();
+      for (const item of additions) {
+        const p = item.sourcePath;
+        if (p && next.some((x) => x.absPath === p || x.sourcePath === p)) continue;
+        next.push(item);
+      }
+      return next;
+    });
   }
 
   async function removeFileFromProject(project, relPath) {
@@ -10241,6 +10288,17 @@
     if (!project || !task) return;
     const raw = String(task.instructions || '').trim();
     if (!raw) return;
+    const taskModelId = String(task.model || '').trim();
+    if (taskModelId) {
+      const api = discoverModelSelectorApi() || buildReduxModelSelectorApi();
+      if (api) {
+        const allOpts = []
+          .concat(Array.isArray(api.modelOptions) ? api.modelOptions : [])
+          .concat(Array.isArray(api.customModels) ? api.customModels : []);
+        const matched = allOpts.find((o) => o && !o.disabled && o.modelId === taskModelId);
+        if (matched) applyModelSelectionOption(api, matched);
+      }
+    }
     const normProj = String(project.dirPath || '').replace(/\/+$/, '');
     const normTaskDir = String(task.folderPath || '').replace(/\/+$/, '');
     const finalPrompt =
@@ -10296,6 +10354,75 @@
     renderProjectScheduledModal();
   }
 
+  function buildScheduledTaskModelGroups(currentModelId) {
+    const api = discoverModelSelectorApi() || buildReduxModelSelectorApi();
+    const rawOpts = api && Array.isArray(api.modelOptions) ? api.modelOptions : [];
+    const customOpts = api && Array.isArray(api.customModels) ? api.customModels : [];
+    const seenIds = new Set();
+    const dynamicOpts = [];
+    for (const o of rawOpts.concat(customOpts)) {
+      if (!o || o.disabled || !o.label) continue;
+      const id = typeof o.modelId === 'string' ? o.modelId.trim() : '';
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+      dynamicOpts.push(o);
+    }
+
+    if (!dynamicOpts.length) {
+      const flatOptions = [
+        { value: 'gemini-4-neon-high', label: 'Gemini 4 Neon High' },
+        { value: 'gemini-4-argon-high', label: 'Gemini 4 Argon High' },
+        { value: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon High' },
+        { value: 'gemini-4-hydrogen-low', label: 'Gemini 4 Hydrogen Low' }
+      ];
+      if (currentModelId && !flatOptions.some((m) => m.value === currentModelId)) {
+        flatOptions.push({ value: currentModelId, label: currentModelId });
+      }
+      return { groups: [], flatOptions, extraOptions: [] };
+    }
+
+    const buckets = { primary: new Map(), orch: new Map(), other: new Map() };
+    for (const o of dynamicOpts) {
+      const parsed = parseModelLabelEffort(o.label);
+      const isOrch = isOrchestratorModelOpt(o);
+      const famMap = buckets[isOrch ? 'orch' : /^gemini\b/i.test(parsed.baseName) ? 'primary' : 'other'];
+      let fam = famMap.get(parsed.baseName);
+      if (!fam) {
+        fam = { baseName: parsed.baseName, variants: [] };
+        famMap.set(parsed.baseName, fam);
+      }
+      fam.variants.push({
+        effort: parsed.effort,
+        opt: o,
+        label: parsed.effort ? `${parsed.baseName} · ${displayEffortLabel(parsed.effort)}` : parsed.baseName
+      });
+    }
+
+    const toOptions = (famList) => {
+      const out = [];
+      for (const fam of famList) {
+        sortFamilyVariants(fam.variants);
+        for (const v of fam.variants) out.push({ value: v.opt.modelId, label: v.label });
+      }
+      return out;
+    };
+
+    const primaryFams = Array.from(buckets.primary.values()).sort(
+      (a, b) => modelCoreRank(a.baseName) - modelCoreRank(b.baseName)
+    );
+    const groups = [
+      { label: L('主力模型', 'Primary models'), options: toOptions(primaryFams) },
+      { label: L('多智能体编排', 'Orchestrators'), options: toOptions(Array.from(buckets.orch.values())) },
+      { label: L('其他模型', 'Other models'), options: toOptions(Array.from(buckets.other.values())) }
+    ].filter((g) => g.options.length > 0);
+
+    const extraOptions =
+      currentModelId && !groups.some((g) => g.options.some((o) => o.value === currentModelId))
+        ? [{ value: currentModelId, label: currentModelId }]
+        : [];
+    return { groups, flatOptions: [], extraOptions };
+  }
+
   function renderProjectScheduledModal() {
     if (!projectsModalState || projectsModalState.kind !== 'scheduled') return;
     if (!projectsModalEl || !projectsModalEl.isConnected) {
@@ -10321,16 +10448,19 @@
       folderOptions.push({ absPath: st.folderPath, label: segs[segs.length - 1] || st.folderPath });
     }
 
-    const modelOptions = [
-      { value: '', label: L('默认模型', 'Default model') },
-      { value: 'gemini-4-neon-high', label: 'Gemini 4 Neon High' },
-      { value: 'gemini-4-argon-high', label: 'Gemini 4 Argon High' },
-      { value: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon High' },
-      { value: 'gemini-4-hydrogen-low', label: 'Gemini 4 Hydrogen Low' }
-    ];
-    if (st.model && !modelOptions.some((m) => m.value === st.model)) {
-      modelOptions.push({ value: st.model, label: st.model });
-    }
+    const modelData = buildScheduledTaskModelGroups(st.model);
+    const renderSchedModelOpt = (m) =>
+      `<option value="${escapeHtml(m.value)}"${m.value === st.model ? ' selected' : ''}>${escapeHtml(m.label)}</option>`;
+    const modelOptionsHtml =
+      renderSchedModelOpt({ value: '', label: L('默认模型', 'Default model') }) +
+      modelData.flatOptions.map(renderSchedModelOpt).join('') +
+      modelData.groups
+        .map(
+          (grp) =>
+            `<optgroup label="${escapeHtml(grp.label)}">${grp.options.map(renderSchedModelOpt).join('')}</optgroup>`
+        )
+        .join('') +
+      modelData.extraOptions.map(renderSchedModelOpt).join('');
 
     const freqOptions = [
       { value: 'manual', label: L('手动', 'Manual') },
@@ -10422,12 +10552,7 @@
               </label>
               <label class="ag-sched-picker-wrap ag-sched-picker-model">
                 <select id="ag-sched-model" class="ag-sched-inline-select" aria-label="${escapeHtml(L('模型', 'Model'))}">
-                  ${modelOptions
-                    .map(
-                      (m) =>
-                        `<option value="${escapeHtml(m.value)}"${m.value === st.model ? ' selected' : ''}>${escapeHtml(m.label)}</option>`
-                    )
-                    .join('')}
+                  ${modelOptionsHtml}
                 </select>
               </label>
             </div>

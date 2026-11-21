@@ -137,6 +137,7 @@
     boot.selectors || {}
   );
   const RPC_TOKEN = typeof boot.rpcToken === 'string' ? boot.rpcToken : '';
+  const RPC_SESSION_ID = typeof boot.rpcSessionId === 'string' ? boot.rpcSessionId : '';
 
   /* Run previous cleanup callbacks before hot-reloading or tearing down */
   if (Array.isArray(window.__ag_cleanup_fns) && window.__ag_cleanup_fns.length > 0) {
@@ -151,6 +152,7 @@
   let runtimeDisposed = false;
   window.__ag_cleanup_fns.push(() => {
     runtimeDisposed = true;
+    window.__ag_rpc_session_id = '';
   });
 
   if (window.__ag_dcl_handler) {
@@ -354,6 +356,7 @@
   /* Lossless teardown when user/config.json sets enabled: false */
   if (!ENABLED) {
     runtimeDisposed = true;
+    window.__ag_rpc_session_id = '';
     window.__ag_watched_cascade_id = '';
     for (const id of ['ag-custom-fonts', 'ag-user-theme-vars', 'antigravity-user-custom-style', 'ag-live-metrics-pill', 'ag-live-metrics-tooltip']) {
       const el = document.getElementById(id);
@@ -871,6 +874,7 @@
 
   /* Local project context RPC bridge (via daemon CDP binding __agProjectRpc) */
   if (!IS_SWARM_PLUGIN_FRAME) {
+    window.__ag_rpc_session_id = RPC_SESSION_ID;
     if (!(window.__ag_project_rpc_pending instanceof Map)) {
       window.__ag_project_rpc_pending = new Map();
     }

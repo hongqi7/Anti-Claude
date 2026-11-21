@@ -2315,3 +2315,382 @@ test('[Code Fold & Sticky Header] collapses native code blocks over 40 lines, re
     window.close();
   }
 });
+
+test('[RPC Token Drift Auto-Heal & Read-Only Verify] heals drifted rpcSessionId on checkAndInject, leaves readOnly attach passive, and falls back to file input on pickFiles failure', { skip: skipDom }, async () => {
+  const daemon = await import(pathToFileURL(path.join(REPO, 'core', 'daemon.mjs')).href);
+  daemon.rebuildBundleIfNeeded();
+  daemon.attachedTargets.clear();
+  daemon.skippedNonHostTargets.clear();
+
+  const origWs = globalThis.WebSocket;
+  const cdpCalls = [];
+  const simState = { hasFonts: true, customJsMounted: true, sessionId: '', injectCount: 0 };
+
+  class MockCdpSocket extends EventTarget {
+    static OPEN = 1;
+    constructor() {
+      super();
+      this.readyState = 1;
+      queueMicrotask(() => this.dispatchEvent(new Event('open')));
+    }
+    emitEvent(method, params) {
+      this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ method, params }) }));
+    }
+    send(raw) {
+      const { id, method, params } = JSON.parse(raw);
+      cdpCalls.push({ method, params });
+      const reply = (result = {}) =>
+        this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ id, result }) }));
+      queueMicrotask(() => {
+        if (method === 'Page.getFrameTree') {
+          reply({ frameTree: { frame: { id: 'main-frame' } } });
+        } else if (method === 'Runtime.enable') {
+          this.emitEvent('Runtime.executionContextCreated', {
+            context: { id: 101, origin: 'http://127.0.0.1:5199', auxData: { frameId: 'main-frame', isDefault: true, type: 'default' } }
+          });
+          reply({});
+        } else if (method === 'Runtime.evaluate') {
+          const expr = String(params && params.expression || '');
+          if (expr.includes("return 'swarm'")) {
+            reply({ result: { value: 'host' } });
+          } else if (expr.includes('document.getElementById("ag-custom-fonts")')) {
+            const ok = new Function('document', 'window', `return (${expr});`)(
+              { getElementById: (eid) => (eid === 'ag-custom-fonts' && simState.hasFonts ? {} : null) },
+              { __ag_custom_js_mounted: simState.customJsMounted, __ag_rpc_session_id: simState.sessionId }
+            );
+            reply({ result: { value: Boolean(ok) } });
+          } else {
+            const m = expr.match(/"rpcSessionId":"([a-f0-9]+)"/i);
+            if (m) {
+              simState.sessionId = m[1];
+              simState.injectCount += 1;
+            }
+            reply({ result: { value: 'dark' } });
+          }
+        } else {
+          reply({});
+        }
+      });
+    }
+    close() {
+      this.readyState = 3;
+      this.dispatchEvent(new Event('close'));
+    }
+  }
+
+  try {
+    globalThis.WebSocket = MockCdpSocket;
+    const endpoint = { channel: 'test', portFile: '', fallbackPort: 0, conversationsDir: os.tmpdir() };
+
+    /* 1. Normal attach mints distinct rpcSessionId & heals drifted page token without tearing down fonts */
+    const page1 = {
+      id: 'target-heal-1',
+      type: 'page',
+      url: 'http://127.0.0.1:5199/',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:5199/devtools/page/target-heal-1'
+    };
+    await daemon.attachTarget(page1, endpoint);
+    const entry1 = daemon.attachedTargets.get(page1.id);
+    assert.ok(entry1 && entry1.rpcSessionId.length === 24, 'mints 24-hex rpcSessionId');
+    assert.notEqual(entry1.rpcSessionId, entry1.rpcToken);
+    assert.equal(simState.sessionId, entry1.rpcSessionId);
+    const baseInjects = simState.injectCount;
+
+    /* Same sessionId -> heartbeat probe passes with zero re-inject */
+    await entry1.checkAndInject(false);
+    assert.equal(simState.injectCount, baseInjects);
+
+    /* Simulate transient verifier overwriting page token/sessionId -> daemon heals on checkAndInject */
+    simState.sessionId = 'stale_verify_once_sid';
+    await entry1.checkAndInject(false);
+    assert.equal(simState.injectCount, baseInjects + 1, 're-injects on rpcSessionId drift');
+    assert.equal(simState.sessionId, entry1.rpcSessionId, 'restores daemon rpcSessionId on page');
+
+    entry1.revokeHostAuth();
+    assert.equal(entry1.rpcToken, '');
+    assert.equal(entry1.rpcSessionId, '');
+
+    /* 2. Read-only attach (used by --verify-once) emits zero addBinding, NewDocument, or runtime inject */
+    cdpCalls.length = 0;
+    const page2 = {
+      id: 'target-ro-1',
+      type: 'page',
+      url: 'http://127.0.0.1:5199/',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:5199/devtools/page/target-ro-1'
+    };
+    await daemon.attachTarget(page2, endpoint, { readOnly: true });
+    const entry2 = daemon.attachedTargets.get(page2.id);
+    assert.equal(entry2.hostConfirmed, true);
+    assert.equal(entry2.rpcToken, '');
+    assert.equal(entry2.rpcSessionId, '');
+    assert.equal(
+      cdpCalls.some((c) => c.method === 'Runtime.addBinding' || c.method === 'Page.addScriptToEvaluateOnNewDocument'),
+      false,
+      'readOnly attach registers zero bindings or NewDocument scripts'
+    );
+    assert.equal(
+      cdpCalls.some((c) => c.method === 'Runtime.evaluate' && String(c.params?.expression || '').includes('__AG_BOOT_PAYLOAD__')),
+      false,
+      'readOnly attach never injects or overwrites live runtime payload'
+    );
+  } finally {
+    globalThis.WebSocket = origWs;
+    for (const [, e] of daemon.attachedTargets.entries()) {
+      try {
+        e.ws.close();
+      } catch {}
+    }
+    daemon.attachedTargets.clear();
+    daemon.skippedNonHostTargets.clear();
+  }
+
+  /* 3. Project Detail [data-ag-pd-add-files] uses pickFiles when ok and falls back to <input type="file"> on error */
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div style="display:flex">
+          <div class="bg-sidebar">
+            <a data-testid="new-conversation-button" href="/">New chat</a>
+            <button data-testid="automations-button" class="agy-button">Automations</button>
+            <a href="/customizations" class="agy-button">Skills &amp; Customizations</a>
+            <div data-testid="conversation-list-sidebar"><div class="w-full relative"></div></div>
+          </div>
+          <main style="flex:1;position:relative"></main>
+        </div>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-active', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  const projCtx = { ok: true, instructions: '', files: [], scheduledTasks: [] };
+  const storeState = {
+    sidebarProjects: {
+      projects: [{ id: 'p-1', name: 'DemoProj', folderUris: ['file:///tmp/p-1'] }]
+    },
+    trajectorySummaries: { summaries: {}, externalSummaries: {}, indexes: { sidebar: [], pinned: [], byProject: {} } }
+  };
+  doc.querySelector('[data-testid="conversation-list-sidebar"]').firstElementChild.__reactFiber$pf = {
+    memoizedProps: { sidebarStore: { getState: () => storeState, subscribe: () => () => {}, dispatch: () => {} } },
+    return: null
+  };
+
+  let pickMode = 'ok';
+  const savedPayloads = [];
+  window.__agProjectCall = async (action, payload) => {
+    if (action === 'listContexts') return { ok: true, contexts: { '/tmp/p-1': projCtx }, projectMtimes: {} };
+    if (action === 'readContext') return projCtx;
+    if (action === 'saveContext') {
+      savedPayloads.push(payload);
+      return { ...projCtx, files: payload.files || [] };
+    }
+    if (action === 'pickFiles') {
+      return pickMode === 'ok'
+        ? { ok: true, canceled: false, paths: ['/tmp/p-1/spec.md'] }
+        : { ok: false, error: 'unauthorized_context' };
+    }
+    if (action === 'saveUiPrefs') return { ok: true };
+    return { ok: false };
+  };
+  window.ctx = { modules: { i18n: false, claudeUxProjects: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    doc.getElementById('ag-claude-projects-nav-btn').click();
+    await new Promise((r) => setTimeout(r, 20));
+    doc.querySelector('.ag-proj-card[data-ag-proj-id="p-1"]').click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const addFilesBtn = doc.querySelector('[data-ag-pd-add-files]');
+    assert.ok(addFilesBtn, 'renders Reference Files + button on Project Detail');
+
+    /* Path A: pickFiles succeeds -> calls saveContext */
+    addFilesBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(savedPayloads.length, 1);
+    assert.equal(savedPayloads[0].files[0].sourcePath, '/tmp/p-1/spec.md');
+
+    /* Path B: pickFiles returns unauthorized_context -> triggers native <input type="file"> fallback */
+    pickMode = 'err';
+    let fallbackFileClicks = 0;
+    const origInputClick = window.HTMLInputElement.prototype.click;
+    window.HTMLInputElement.prototype.click = function () {
+      if (this.type === 'file') fallbackFileClicks += 1;
+      return origInputClick.apply(this, arguments);
+    };
+    addFilesBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(fallbackFileClicks, 1, 'triggers native file input picker fallback when RPC pickFiles fails');
+
+    /* Path C: Electron host (electronNative.getPathForFile) opens instant native <input type="file"> without calling pickFiles RPC */
+    let pickFilesCalledWhenElectron = 0;
+    const origProjectCall = window.__agProjectCall;
+    window.__agProjectCall = (action, payload) => {
+      if (action === 'pickFiles') {
+        pickFilesCalledWhenElectron += 1;
+        return Promise.resolve({ ok: false });
+      }
+      return origProjectCall(action, payload);
+    };
+    window.electronNative = { getPathForFile: (f) => (f && f.name ? `/tmp/p-1/${f.name}` : '') };
+    let instantInputEl = null;
+    window.HTMLInputElement.prototype.click = function () {
+      if (this.type === 'file') instantInputEl = this;
+    };
+    addFilesBtn.click();
+    assert.ok(instantInputEl, 'synchronously triggers <input type="file"> when electronNative.getPathForFile exists');
+    assert.equal(pickFilesCalledWhenElectron, 0, 'skips slow osascript pickFiles RPC on Electron host');
+    Object.defineProperty(instantInputEl, 'files', {
+      value: [{ name: 'instant-doc.pdf', size: 128 }],
+      configurable: true
+    });
+    instantInputEl.dispatchEvent(new window.Event('change'));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(savedPayloads.length, 2);
+    assert.equal(savedPayloads[1].files.some((f) => f.sourcePath === '/tmp/p-1/instant-doc.pdf'), true);
+  } finally {
+    window.close();
+  }
+});
+
+test('[Scheduled Task Dynamic Models] populates account models & all effort tiers from Redux, preserves legacy IDs on edit, and syncs model on Run Now', { skip: skipDom }, async () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div style="display:flex">
+          <div class="bg-sidebar">
+            <a data-testid="new-conversation-button" href="/">New chat</a>
+            <button data-testid="automations-button" class="agy-button">Automations</button>
+            <a href="/customizations" class="agy-button">Skills &amp; Customizations</a>
+            <div data-testid="conversation-list-sidebar"><div class="w-full relative"></div></div>
+          </div>
+          <main style="flex:1;position:relative"></main>
+        </div>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-active', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  const dispatched = [];
+  const storeState = {
+    sidebarProjects: { projects: [{ id: 'p-1', name: 'DemoProj', folderUris: ['file:///tmp/p-1'] }] },
+    trajectorySummaries: { summaries: {}, externalSummaries: {}, indexes: { sidebar: [], pinned: [], byProject: {} } },
+    userStatus: {
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          { label: 'Gemini 4 Neon (XHigh)', modelId: 'gemini-4-neon-xhigh', value: 1535, disabled: false },
+          { label: 'Gemini 4 Neon (High)', modelId: 'gemini-4-neon-high', value: 1532, disabled: false },
+          { label: 'Gemini 4 Neon (Medium)', modelId: 'gemini-4-neon-medium', value: 1533, disabled: false },
+          { label: 'Gemini 4 Neon (Low)', modelId: 'gemini-4-neon-low', value: 1534, disabled: false },
+          { label: 'Claude Opus 5.5 (Low)', modelId: 'claude-opus-5-5-low', value: 1400, disabled: false },
+          { label: 'Claude Opus 5.5 (Medium)', modelId: 'claude-opus-5-5-medium', value: 1401, disabled: false },
+          { label: 'Claude Opus 5.5 (High)', modelId: 'claude-opus-5-5-high', value: 1402, disabled: false },
+          { label: 'Orchestrator (Neon)', modelId: 'gemini-pro-orchestrator-neon', value: 1537, disabled: false },
+          { label: 'Legacy Disabled Model', modelId: 'legacy-disabled-id', value: 9999, disabled: true }
+        ]
+      }
+    },
+    modelSelection: { default: { model: 1532 } }
+  };
+  doc.querySelector('[data-testid="conversation-list-sidebar"]').firstElementChild.__reactFiber$sm = {
+    memoizedProps: {
+      sidebarStore: { getState: () => storeState, subscribe: () => () => {}, dispatch: (a) => dispatched.push(a) },
+      sidebarRouter: { state: { location: { pathname: '/c/c-active' } }, navigate: () => {} }
+    },
+    return: null
+  };
+
+  const projCtx = {
+    ok: true,
+    instructions: '',
+    files: [],
+    scheduledTasks: [
+      {
+        id: 'sched-legacy',
+        name: 'legacy-job',
+        description: 'Legacy job',
+        instructions: 'Run legacy flow',
+        folderPath: '/tmp/p-1',
+        model: 'legacy-custom-id',
+        frequency: 'manual'
+      }
+    ]
+  };
+  let savedScheduledPayload = null;
+  window.__agProjectCall = async (action, payload) => {
+    if (action === 'listContexts') return { ok: true, contexts: { '/tmp/p-1': projCtx }, projectMtimes: {} };
+    if (action === 'readContext') return projCtx;
+    if (action === 'saveScheduledTask') {
+      savedScheduledPayload = payload;
+      const saved = Object.assign({}, payload.task, { id: 'sched-new' });
+      projCtx.scheduledTasks = projCtx.scheduledTasks.concat([saved]);
+      return projCtx;
+    }
+    if (action === 'saveUiPrefs') return { ok: true };
+    return { ok: false };
+  };
+  window.ctx = { modules: { i18n: false, claudeUxProjects: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    doc.getElementById('ag-claude-projects-nav-btn').click();
+    await new Promise((r) => setTimeout(r, 20));
+    doc.querySelector('.ag-proj-card[data-ag-proj-id="p-1"]').click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    /* 1. Editing existing task with unknown legacy-custom-id preserves & selects it */
+    doc.querySelector('[data-ag-pd-edit-sched="sched-legacy"]').click();
+    await new Promise((r) => setTimeout(r, 10));
+    const editSel = doc.getElementById('ag-sched-model');
+    assert.equal(editSel.value, 'legacy-custom-id', 'preserves legacy unknown modelId when editing existing task');
+    doc.querySelector('[data-ag-pm-close]').click();
+
+    /* 2. Creating new task dynamically lists all enabled models & effort tiers in grouped <optgroup>s */
+    doc.querySelector('[data-ag-pd-add-sched]').click();
+    await new Promise((r) => setTimeout(r, 10));
+    const modelSel = doc.getElementById('ag-sched-model');
+    assert.equal(modelSel.querySelectorAll('optgroup').length, 3, 'renders Primary / Orchestrators / Other optgroups');
+    const optMap = new Map(Array.from(modelSel.querySelectorAll('option')).map((o) => [o.value, o.textContent]));
+    for (const reqId of [
+      'gemini-4-neon-low',
+      'gemini-4-neon-medium',
+      'gemini-4-neon-high',
+      'gemini-4-neon-xhigh',
+      'claude-opus-5-5-low',
+      'claude-opus-5-5-medium',
+      'claude-opus-5-5-high',
+      'gemini-pro-orchestrator-neon'
+    ]) {
+      assert.equal(optMap.has(reqId), true, `contains dynamic model ${reqId}`);
+    }
+    assert.equal(optMap.get('gemini-4-neon-xhigh'), 'Gemini 4 Neon · Extra', 'formats XHigh as Extra');
+    assert.equal(optMap.has('legacy-disabled-id'), false, 'filters out disabled models');
+
+    /* 3. Selecting Neon Extra + saving passes gemini-4-neon-xhigh to saveScheduledTask */
+    const setVal = (sel, val, ev = 'input') => {
+      const el = doc.querySelector(sel);
+      el.value = val;
+      el.dispatchEvent(new window.Event(ev, { bubbles: true }));
+    };
+    setVal('#ag-sched-name', 'neon-extra-job');
+    setVal('#ag-sched-desc', 'Deep nightly check');
+    setVal('#ag-sched-instructions', 'Inspect codebase deeply');
+    setVal('#ag-sched-model', 'gemini-4-neon-xhigh', 'change');
+    doc.querySelector('[data-ag-sched-save]').click();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(savedScheduledPayload.task.model, 'gemini-4-neon-xhigh');
+
+    /* 4. Clicking Run Now dispatches modelSelection/modelPicked for task.model (1535) */
+    dispatched.length = 0;
+    doc.querySelector('[data-ag-pd-run-sched="sched-new"]').click();
+    assert.ok(
+      dispatched.some((a) => a && a.type === 'modelSelection/modelPicked' && a.payload && a.payload.model === 1535),
+      'Run Now syncs selected task model before starting conversation'
+    );
+  } finally {
+    window.close();
+  }
+});

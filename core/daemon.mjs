@@ -812,11 +812,12 @@ function rebuildBundleIfNeeded() {
   return true;
 }
 
-function buildRuntimeScript(hostThemeMode = null, rpcToken = '') {
+function buildRuntimeScript(hostThemeMode = null, rpcToken = '', rpcSessionId = '') {
   if (!cachedRuntimeTemplate || !cachedBootPayloadBase) return '';
   const extra = {};
   if (hostThemeMode) extra.hostThemeMode = hostThemeMode;
   if (rpcToken) extra.rpcToken = rpcToken;
+  if (rpcSessionId) extra.rpcSessionId = rpcSessionId;
   const payload = Object.keys(extra).length > 0 ? Object.assign({}, cachedBootPayloadBase, extra) : cachedBootPayloadBase;
   return cachedRuntimeTemplate.replace('(__AG_BOOT_PAYLOAD__);', () => `(${JSON.stringify(payload)});`);
 }
@@ -2131,6 +2132,7 @@ function pickLocalFilesNative() {
   return new Promise((resolve) => {
     if (process.platform === 'darwin') {
       const script = [
+        'activate',
         'set fs to choose file with prompt "选择要添加到项目上下文的参考文件" with multiple selections allowed',
         'set out to ""',
         'repeat with f in fs',
@@ -2140,8 +2142,16 @@ function pickLocalFilesNative() {
       ];
       const args = [];
       for (const line of script) args.push('-e', line);
-      execFile('osascript', args, { timeout: 120000 }, (err, stdout) => {
-        if (err || !stdout) return resolve({ ok: true, canceled: true, paths: [] });
+      execFile('osascript', args, { timeout: 120000 }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = `${err.message || ''}\n${stderr || ''}`;
+          if (/User canceled|-128/i.test(msg)) {
+            return resolve({ ok: true, canceled: true, paths: [] });
+          }
+          console.error('[Anti-Claude Daemon] pickLocalFilesNative failed:', msg.trim());
+          return resolve({ ok: false, error: msg.trim() || 'pick_files_failed', paths: [] });
+        }
+        if (!stdout) return resolve({ ok: true, canceled: true, paths: [] });
         const paths = String(stdout)
           .split(/\r?\n/)
           .map((s) => s.trim())
@@ -2176,10 +2186,18 @@ function pickLocalFolderNative() {
     if (process.platform === 'darwin') {
       execFile(
         'osascript',
-        ['-e', 'POSIX path of (choose folder with prompt "选择要加入本项目的本地文件夹")'],
+        ['-e', 'activate', '-e', 'POSIX path of (choose folder with prompt "选择要加入本项目的本地文件夹")'],
         { timeout: 120000 },
-        (err, stdout) => {
-          if (err || !stdout) return resolve({ ok: true, canceled: true, folderPath: '' });
+        (err, stdout, stderr) => {
+          if (err) {
+            const msg = `${err.message || ''}\n${stderr || ''}`;
+            if (/User canceled|-128/i.test(msg)) {
+              return resolve({ ok: true, canceled: true, folderPath: '' });
+            }
+            console.error('[Anti-Claude Daemon] pickLocalFolderNative failed:', msg.trim());
+            return resolve({ ok: false, error: msg.trim() || 'pick_folder_failed', folderPath: '' });
+          }
+          if (!stdout) return resolve({ ok: true, canceled: true, folderPath: '' });
           const folderPath = String(stdout).trim().replace(/\/+$/, '');
           if (!folderPath || !fs.existsSync(folderPath)) return resolve({ ok: true, canceled: true, folderPath: '' });
           resolve({ ok: true, canceled: false, folderPath, name: path.basename(folderPath) || folderPath });
@@ -2557,7 +2575,8 @@ function resolveParentHostTheme(page) {
   return null;
 }
 
-export async function attachTarget(page, endpoint) {
+export async function attachTarget(page, endpoint, opts = {}) {
+  const readOnly = Boolean(opts && opts.readOnly);
   const wsUrl = String(page.webSocketDebuggerUrl || '').replace(/^ws:\/\/localhost:/i, 'ws://127.0.0.1:');
   if (!wsUrl) return;
 
@@ -2611,6 +2630,7 @@ export async function attachTarget(page, endpoint) {
     mainFrameId: null,
     trustedContextId: null,
     rpcToken: '',
+    rpcSessionId: '',
     navGen: 0,
     contextMeta: new Map(),
     defaultContextByFrame: new Map(),
@@ -2622,6 +2642,7 @@ export async function attachTarget(page, endpoint) {
       entry.hostConfirmed = false;
       entry.trustedContextId = null;
       entry.rpcToken = '';
+      entry.rpcSessionId = '';
       entry.injectedBundleHash = '';
     },
     isAuthorizedBindingCaller(executionContextId) {
@@ -2720,13 +2741,18 @@ export async function attachTarget(page, endpoint) {
     entry.newDocScriptId = res?.result?.identifier || null;
   };
 
-  entry.injectNow = async () => {
+  entry.injectNow = async (issueRpcAuth = true) => {
     if (!entry.hostConfirmed) return;
     const hostMode = page.type === 'iframe' ? resolveParentHostTheme(page) : null;
-    if (page.type === 'page' && !entry.rpcToken) {
-      entry.rpcToken = crypto.randomBytes(24).toString('hex');
+    if (issueRpcAuth && page.type === 'page') {
+      if (!entry.rpcToken) entry.rpcToken = crypto.randomBytes(24).toString('hex');
+      if (!entry.rpcSessionId) entry.rpcSessionId = crypto.randomBytes(12).toString('hex');
     }
-    const scriptSource = buildRuntimeScript(hostMode, page.type === 'page' ? entry.rpcToken : '');
+    const scriptSource = buildRuntimeScript(
+      hostMode,
+      issueRpcAuth && page.type === 'page' ? entry.rpcToken : '',
+      issueRpcAuth && page.type === 'page' ? entry.rpcSessionId : ''
+    );
     if (!scriptSource) return;
     const evalRes = await evalInHostContext(scriptSource, true).catch(() => null);
     entry.injectedBundleHash = cachedBundleHash;
@@ -2744,8 +2770,12 @@ export async function attachTarget(page, endpoint) {
     }
     if (!activeConfig.enabled) return;
     const needCustomJs = page.type === 'page' && activeConfig.modules.customJs !== false;
+    const sessionCheck =
+      page.type === 'page' && entry.rpcSessionId
+        ? ` && window.__ag_rpc_session_id === ${JSON.stringify(entry.rpcSessionId)}`
+        : '';
     const probe = await evalInHostContext(
-      `Boolean(document.getElementById("ag-custom-fonts")) && (!document.body || !${needCustomJs} || Boolean(window.__ag_custom_js_mounted))`,
+      `Boolean(document.getElementById("ag-custom-fonts"))${sessionCheck} && (!document.body || !${needCustomJs} || Boolean(window.__ag_custom_js_mounted))`,
       true
     ).catch(() => null);
     if (probe?.result?.result?.value === false) {
@@ -2778,8 +2808,10 @@ export async function attachTarget(page, endpoint) {
     }
     entry.trustedContextId =
       (entry.mainFrameId && entry.defaultContextByFrame.get(entry.mainFrameId)) ?? candidateCtxId ?? null;
-    entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
     entry.hostConfirmed = true;
+    if (readOnly) return;
+    entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
+    entry.rpcSessionId = page.type === 'page' ? crypto.randomBytes(12).toString('hex') : '';
     if (page.type === 'page' && entry.trustedContextId !== null) {
       await send('Runtime.addBinding', { name: '__agProjectRpc', executionContextId: entry.trustedContextId }).catch(() => {});
     }
@@ -2944,9 +2976,13 @@ export async function attachTarget(page, endpoint) {
 
     entry.trustedContextId =
       (entry.mainFrameId && entry.defaultContextByFrame.get(entry.mainFrameId)) ?? candidateCtxId ?? null;
-    entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
     entry.hostConfirmed = true;
     attachedTargets.set(page.id, entry);
+
+    if (readOnly) return;
+
+    entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
+    entry.rpcSessionId = page.type === 'page' ? crypto.randomBytes(12).toString('hex') : '';
 
     if (page.type === 'page') {
       const bindParams = (name) =>
@@ -2981,15 +3017,16 @@ let isSyncing = false;
 let syncTickCount = 0;
 let lastReachablePort = 0;
 
-async function sync() {
+async function sync(opts = {}) {
+  const readOnly = Boolean(opts && opts.readOnly);
   checkPidOwnership();
   if (isSyncing) return;
   isSyncing = true;
   syncTickCount = (syncTickCount + 1) % 6000;
   try {
     const bundleChanged = rebuildBundleIfNeeded();
-    if (!activeConfig.enabled) targetThemeModes.clear();
-    const shouldHeartbeatCheck = bundleChanged || syncTickCount % 6 === 1;
+    if (!readOnly && !activeConfig.enabled) targetThemeModes.clear();
+    const shouldHeartbeatCheck = !readOnly && (bundleChanged || syncTickCount % 6 === 1);
 
     const activeTargetIds = new Set();
     const seenRawTargetIds = new Set();
@@ -3060,8 +3097,8 @@ async function sync() {
       const attaches = [];
       for (const { page, endpoint } of items) {
         if (!attachedTargets.has(page.id)) {
-          attaches.push(attachTarget(page, endpoint));
-        } else {
+          attaches.push(attachTarget(page, endpoint, { readOnly }));
+        } else if (!readOnly) {
           const entry = attachedTargets.get(page.id);
           entry.endpoint = endpoint;
           entry.parentId = page.parentId || entry.parentId || null;
@@ -3099,30 +3136,50 @@ async function sync() {
 }
 
 async function runVerifyOnce() {
-  await sync();
-  let themeStyle = { present: false, length: 0 };
-  let customStyle = { present: false, length: 0 };
-  let hostPages = 0;
+  await sync({ readOnly: true });
+  const inspectLiveStyles = async () => {
+    let themeStyle = { present: false, length: 0 };
+    let customStyle = { present: false, length: 0 };
+    let hostPages = 0;
 
-  for (const [, entry] of attachedTargets.entries()) {
-    if (!entry.hostConfirmed || entry.type !== 'page') continue;
-    hostPages += 1;
-    const r = await entry
-      .send('Runtime.evaluate', {
-        expression: `(function () {
-          const s1 = document.getElementById('ag-custom-fonts');
-          const s2 = document.getElementById('antigravity-user-custom-style');
-          return {
-            themeStyle: { present: Boolean(s1), length: s1 ? (s1.textContent || '').length : 0 },
-            customStyle: { present: Boolean(s2), length: s2 ? (s2.textContent || '').length : 0 }
-          };
-        })()`,
-        returnByValue: true
-      })
-      .catch(() => null);
-    const val = r?.result?.result?.value;
-    if (val?.themeStyle?.present) themeStyle = val.themeStyle;
-    if (val?.customStyle?.present) customStyle = val.customStyle;
+    for (const [, entry] of attachedTargets.entries()) {
+      if (!entry.hostConfirmed || entry.type !== 'page') continue;
+      hostPages += 1;
+      const r = await entry
+        .send('Runtime.evaluate', {
+          expression: `(function () {
+            const s1 = document.getElementById('ag-custom-fonts');
+            const s2 = document.getElementById('antigravity-user-custom-style');
+            return {
+              themeStyle: { present: Boolean(s1), length: s1 ? (s1.textContent || '').length : 0 },
+              customStyle: { present: Boolean(s2), length: s2 ? (s2.textContent || '').length : 0 }
+            };
+          })()`,
+          returnByValue: true
+        })
+        .catch(() => null);
+      const val = r?.result?.result?.value;
+      if (val?.themeStyle?.present) themeStyle = val.themeStyle;
+      if (val?.customStyle?.present) customStyle = val.customStyle;
+    }
+    return { themeStyle, customStyle, hostPages };
+  };
+
+  let { themeStyle, customStyle, hostPages } = await inspectLiveStyles();
+  const stylesReady = () => themeStyle.present && (!activeConfig.modules.customCss || customStyle.present);
+  if (hostPages > 0 && activeConfig.enabled && !stylesReady()) {
+    for (let i = 0; i < 4 && !stylesReady(); i++) {
+      await new Promise((r) => setTimeout(r, 350));
+      ({ themeStyle, customStyle, hostPages } = await inspectLiveStyles());
+    }
+    if (!stylesReady()) {
+      for (const [, entry] of attachedTargets.entries()) {
+        if (entry.hostConfirmed && entry.type === 'page') {
+          await entry.injectNow(false);
+        }
+      }
+      ({ themeStyle, customStyle, hostPages } = await inspectLiveStyles());
+    }
   }
 
   for (const [, entry] of attachedTargets.entries()) {
