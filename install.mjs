@@ -1325,9 +1325,24 @@ function ensureCoreDaemon() {
       execFileSync('launchctl', ['bootout', `gui/${uid}`, DAEMON_PLIST], { stdio: 'ignore' });
     } catch {}
     try {
+      execFileSync('launchctl', ['enable', `gui/${uid}/${DAEMON_LABEL}`], { stdio: 'ignore' });
+    } catch {}
+    try {
       execFileSync('launchctl', ['bootstrap', `gui/${uid}`, DAEMON_PLIST], { stdio: 'pipe' });
       execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${DAEMON_LABEL}`], { stdio: 'ignore' });
     } catch (err) {
+      const pid = spawnDetachedDaemon(nodePath);
+      if (pid) {
+        return {
+          ok: true,
+          label: DAEMON_LABEL,
+          plist: DAEMON_PLIST,
+          node: nodePath,
+          pid,
+          fallbackDetached: true,
+          launchctlNote: String(err?.stderr || err?.message).trim()
+        };
+      }
       return { ok: false, reason: `launchctl_bootstrap_failed: ${String(err?.stderr || err?.message).trim()}`, plist: DAEMON_PLIST };
     }
     return { ok: true, label: DAEMON_LABEL, plist: DAEMON_PLIST, node: nodePath };
@@ -1509,6 +1524,9 @@ function enableMacAutoUpdateAgent() {
   }
   try {
     execFileSync('launchctl', ['bootout', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'ignore' });
+  } catch {}
+  try {
+    execFileSync('launchctl', ['enable', `gui/${uid}/${AUTOSYNC_LABEL}`], { stdio: 'ignore' });
   } catch {}
   try {
     execFileSync('launchctl', ['bootstrap', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'pipe' });

@@ -1800,3 +1800,178 @@ test('[Language Persistence Across Ephemeral Port Restarts] persists Chinese/Eng
     fs.rmSync(uiPrefsPath, { force: true });
   }
 });
+
+test('[v2.34 Conversation Drag, URL Auto-Link & Skill Pill] supports dragging Unified Recents & Project chats as context-scope-item-cider mentions, styles Lexical/bubble URL links, and preserves clickable skill-scope-item-pill', { skip: skipDom }, async () => {
+  const customCssSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.css'), 'utf8');
+  assert.match(
+    customCssSrc,
+    /\[data-lexical-editor="true"\]\s*:is\(a\.text-link,\s*a\[href\]\)[\s\S]*?text-decoration-line:\s*underline\s*!important/,
+    'custom.css keeps Lexical AutoLink URLs visually underlined & clickable'
+  );
+  assert.match(
+    customCssSrc,
+    /\[data-testid="skill-scope-item-pill"\][\s\S]*?pointer-events:\s*auto\s*!important/,
+    'custom.css keeps skill-scope-item-pill clickable'
+  );
+
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div style="display:flex">
+          <div class="bg-sidebar">
+            <div class="flex flex-col gap-1.5">
+              <a data-testid="new-conversation-button" href="/">New chat</a>
+              <button data-testid="automations-button" class="agy-button">Automations</button>
+              <a href="/customizations" class="agy-button">Skills &amp; Customizations</a>
+            </div>
+            <div class="sb-grand flex-1 min-h-0 overflow-y-auto flex flex-col">
+              <div class="sb-parent w-full relative flex-1">
+                <div data-testid="conversation-list-sidebar">
+                  <div class="w-full relative" style="height: 200px;">
+                    <div data-index="0" style="position: absolute; transform: translateY(0px);"><div data-testid="section-header"><span>Projects</span><button data-testid="sidebar-add-project-button"></button></div></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <main style="flex:1;position:relative">
+            <div data-testid="conversation-view" data-cascade-id="c-active">
+              <div data-testid="user-input-step">
+                <div class="agy-user-bubble">
+                  <div data-testid="user-message-content">
+                    <bdi class="context-scope-mention" data-quotable-inline="true">
+                      <span data-testid="skill-scope-item-pill" role="button" data-uri="file:///Users/dev/.gemini/config/skills/browse/SKILL.md">Browse</span>
+                    </bdi>
+                  </div>
+                </div>
+              </div>
+              <div id="antigravity.agentSidePanelInputBox"><div data-lexical-editor="true"></div></div>
+            </div>
+          </main>
+        </div>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-active', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+
+  const { window } = dom;
+  const doc = window.document;
+  const openedUrls = [];
+  window.open = (u) => {
+    openedUrls.push(u);
+    return null;
+  };
+  let skillPillClicks = 0;
+  doc.querySelector('[data-testid="skill-scope-item-pill"]').addEventListener('click', () => {
+    skillPillClicks += 1;
+  });
+
+  const storeState = {
+    sidebarProjects: {
+      projects: [{ id: 'proj-1', name: '技术（Antigravity）', folderUris: ['file:///Users/dev/agy'] }]
+    },
+    projects: {
+      projects: {
+        'proj-1': { id: 'proj-1', name: '技术（Antigravity）', workspaceUris: ['file:///Users/dev/agy'] }
+      },
+      order: ['proj-1'],
+      archivedOrder: []
+    },
+    trajectorySummaries: {
+      summaries: {
+        'c-rec-1': {
+          annotations: { title: '反重力界面改造记录' },
+          summary: '反重力界面改造记录',
+          trajectoryMetadata: { projectId: 'proj-1' },
+          lastModifiedTime: { seconds: Math.floor(Date.now() / 1000) - 90 },
+          status: 1
+        }
+      },
+      externalSummaries: {},
+      indexes: { sidebar: ['c-rec-1'], pinned: [] }
+    }
+  };
+  let navigatedCid = null;
+  const mockStore = { getState: () => storeState, subscribe: () => () => {}, dispatch: () => {} };
+  const mockRouter = { state: { location: { pathname: '/c/c-active' } }, navigate: ({ to }) => (navigatedCid = to) };
+  doc.querySelector('[data-testid="conversation-list-sidebar"]').firstElementChild.__reactFiber$v234 = {
+    memoizedProps: { sidebarStore: mockStore, sidebarRouter: mockRouter },
+    return: null
+  };
+  window.__agProjectCall = async (action) => {
+    if (action === 'listContexts') return { ok: true, contexts: {}, projectMtimes: {} };
+    if (action === 'readContext') return { ok: true, instructions: '', files: [], scheduledTasks: [] };
+    if (action === 'saveUiPrefs') return { ok: true };
+    return { ok: false };
+  };
+  window.ctx = {
+    modules: { i18n: true, claudeUxProjects: true, claudeUxHideSidebarProjects: true },
+    dict: { Browse: '分类浏览', Skills: '技能' },
+    onCleanup: () => {}
+  };
+  window.eval(customJsSrc);
+
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+
+    /* 1. Skill pill text is NOT mangled by i18n ("Browse" stays "Browse", not "分类浏览") and click fires cleanly */
+    const skillPill = doc.querySelector('[data-testid="skill-scope-item-pill"]');
+    assert.equal(skillPill.textContent, 'Browse', 'preserves exact skill name inside skill-scope-item-pill');
+    skillPill.click();
+    assert.equal(skillPillClicks, 1, 'skill pill click propagates cleanly to native side-pane opener');
+
+    /* 2. Unified Recents row sets application/context-scope-item-cider on dragstart and suppresses accidental click navigation */
+    const recRow = doc.querySelector('.ag-recent-row[data-ag-recent-id="c-rec-1"]');
+    assert.ok(recRow, 'renders Unified Recents row');
+    assert.equal(recRow.getAttribute('draggable'), 'true');
+    const dragBag = new Map();
+    const dragStartEv = new window.Event('dragstart', { bubbles: true, cancelable: true });
+    Object.defineProperty(dragStartEv, 'dataTransfer', {
+      value: {
+        effectAllowed: 'none',
+        setData: (k, v) => dragBag.set(k, v),
+        getData: (k) => dragBag.get(k) || '',
+        types: ['application/context-scope-item-cider']
+      }
+    });
+    recRow.dispatchEvent(dragStartEv);
+    assert.equal(
+      dragBag.get('application/context-scope-item-cider'),
+      JSON.stringify({ conversation: { id: 'c-rec-1', title: '反重力界面改造记录' } }),
+      'emits v2.34 ContextScopeItemSchema JSON payload on dragstart'
+    );
+    recRow.dispatchEvent(new window.Event('dragend', { bubbles: true }));
+    recRow.click();
+    assert.equal(navigatedCid, null, 'suppresses post-drag accidental click navigation');
+
+    /* 3. Drop conversation onto Project Detail composer -> inserts @[反重力界面改造记录] pill, and Cmd+Click opens URL */
+    doc.getElementById('ag-claude-projects-nav-btn').click();
+    await new Promise((r) => setTimeout(r, 20));
+    doc.querySelector('[data-ag-proj-id="proj-1"]').click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const compBox = doc.querySelector('[data-ag-pd-composer-box]');
+    const compInput = doc.getElementById('ag-pd-composer-input');
+    const dropEv = new window.Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(dropEv, 'dataTransfer', {
+      value: {
+        types: ['application/context-scope-item-cider'],
+        getData: (k) => dragBag.get(k) || '',
+        files: [],
+        items: []
+      }
+    });
+    compBox.dispatchEvent(dropEv);
+    assert.match(compInput.value, /@\[反重力界面改造记录\]/, 'inserts dragged conversation mention into Project composer');
+    assert.ok(doc.querySelector('#ag-pd-mention-pills .ag-pd-mention-pill'), 'renders conversation mention pill above composer');
+
+    compInput.value += '请参考 https://antigravity.google/docs 文档';
+    const urlPos = compInput.value.indexOf('antigravity.google');
+    compInput.setSelectionRange(urlPos, urlPos);
+    compInput.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true, metaKey: true }));
+    assert.deepEqual(openedUrls, ['https://antigravity.google/docs'], 'Cmd+Click on URL inside Project composer opens link');
+  } finally {
+    window.close();
+  }
+});

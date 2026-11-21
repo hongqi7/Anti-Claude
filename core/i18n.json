@@ -1747,5 +1747,14 @@
   "SSH Host…": "SSH 主机…",
   "Browse": "分类浏览",
   "Browse rules": "浏览规则",
-  "Search conversations": "搜索对话"
+  "Search conversations": "搜索对话",
+  "Cmd+click to open": "⌘+点击打开链接",
+  "Ctrl+click to open": "Ctrl+点击打开链接",
+  "Open in Side Panel": "在侧边栏中打开",
+  "Open in External Browser": "在外部浏览器中打开",
+  "Keep Open": "保持打开",
+  "Pin Tab": "固定标签页",
+  "Unpin Tab": "取消固定标签页",
+  "Unsent draft": "未发送草稿",
+  "Drop to add to group": "拖放到此处加入分组"
 }

@@ -4108,6 +4108,338 @@
   let recentMenuState = null;
   let recentMenuDocBound = false;
   let recentItemsById = new Map();
+  let recentLastDragEndTs = 0;
+
+  /* ---- v2.34+ Conversation & File Drag-to-Composer (`application/context-scope-item-cider`) ---- */
+  function buildCiderConversationPayload(id, title) {
+    const cleanTitle = String(title || '').trim() || L('对话', 'Conversation');
+    return JSON.stringify({ conversation: { id: String(id || ''), title: cleanTitle } });
+  }
+
+  function buildCiderFilePayload(absPathOrUri) {
+    const raw = String(absPathOrUri || '').trim();
+    if (!raw) return '';
+    const uri = /^file:\/\//i.test(raw) ? raw : `file://${encodeURI(raw.startsWith('/') ? raw : `/${raw}`)}`;
+    return JSON.stringify({ file: { absoluteUri: uri } });
+  }
+
+  function attachConversationDragTransfer(dt, id, title) {
+    if (!dt || !id) return false;
+    const payload = buildCiderConversationPayload(id, title);
+    try {
+      dt.effectAllowed = 'copyMove';
+    } catch {}
+    try {
+      dt.setData('application/context-scope-item-cider', payload);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function attachFileDragTransfer(dt, absPathOrUri) {
+    if (!dt || !absPathOrUri) return false;
+    const payload = buildCiderFilePayload(absPathOrUri);
+    if (!payload) return false;
+    const raw = String(absPathOrUri || '').trim();
+    const uri = /^file:\/\//i.test(raw) ? raw : `file://${encodeURI(raw.startsWith('/') ? raw : `/${raw}`)}`;
+    try {
+      dt.effectAllowed = 'copyMove';
+    } catch {}
+    try {
+      dt.setData('application/context-scope-item-cider', payload);
+      dt.setData('application/vnd.code.uri-list', uri);
+      dt.setData('text/uri-list', uri);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function hasDroppedContextPayload(dt) {
+    if (!dt) return false;
+    const types = Array.from(dt.types || [], (t) => String(t || '').toLowerCase());
+    return (
+      types.includes('application/context-scope-item-cider') ||
+      types.includes('application/vnd.code.uri-list') ||
+      types.includes('resourceurls')
+    );
+  }
+
+  function extractDroppedContextMentions(dt) {
+    if (!dt) return [];
+    const out = [];
+    let rawCider = '';
+    try {
+      rawCider = dt.getData('application/context-scope-item-cider') || '';
+    } catch {}
+    if (rawCider && rawCider.trim()) {
+      try {
+        const parsed = JSON.parse(rawCider.trim());
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        for (let entry of arr) {
+          if (typeof entry === 'string') {
+            try {
+              entry = JSON.parse(entry);
+            } catch {
+              continue;
+            }
+          }
+          if (!entry || typeof entry !== 'object') continue;
+          const conv =
+            entry.conversation ||
+            (entry.scopeItem && entry.scopeItem.case === 'conversation' ? entry.scopeItem.value : null);
+          if (conv && conv.id) {
+            const label = String(conv.title || '').trim() || conv.id.slice(0, 8);
+            out.push({
+              kind: 'conversation',
+              label,
+              scopeItem: {
+                $typeName: 'exa.codeium_common_pb.ContextScopeItem',
+                scopeItem: {
+                  case: 'conversation',
+                  value: {
+                    $typeName: 'exa.codeium_common_pb.ConversationScopeItem',
+                    id: String(conv.id),
+                    title: label,
+                    source: String(conv.source || '')
+                  }
+                }
+              }
+            });
+            continue;
+          }
+          const fileObj =
+            entry.file ||
+            entry.fileLineRange ||
+            (entry.scopeItem && (entry.scopeItem.case === 'file' || entry.scopeItem.case === 'fileLineRange')
+              ? entry.scopeItem.value
+              : null);
+          if (fileObj && fileObj.absoluteUri) {
+            const uri = String(fileObj.absoluteUri);
+            let label = uri.split('/').pop() || uri;
+            try {
+              label = decodeURIComponent(label);
+            } catch {}
+            out.push({
+              kind: 'file',
+              label,
+              scopeItem: {
+                $typeName: 'exa.codeium_common_pb.ContextScopeItem',
+                scopeItem: {
+                  case: 'file',
+                  value: {
+                    $typeName: 'exa.codeium_common_pb.FileScopeItem',
+                    absoluteUri: uri
+                  }
+                }
+              }
+            });
+            continue;
+          }
+          const dirObj =
+            entry.directory ||
+            (entry.scopeItem && entry.scopeItem.case === 'directory' ? entry.scopeItem.value : null);
+          if (dirObj && dirObj.absoluteUri) {
+            const uri = String(dirObj.absoluteUri);
+            let label = uri.replace(/\/+$/, '').split('/').pop() || uri;
+            try {
+              label = decodeURIComponent(label);
+            } catch {}
+            out.push({
+              kind: 'directory',
+              label,
+              scopeItem: {
+                $typeName: 'exa.codeium_common_pb.ContextScopeItem',
+                scopeItem: {
+                  case: 'directory',
+                  value: {
+                    $typeName: 'exa.codeium_common_pb.DirectoryScopeItem',
+                    absoluteUri: uri
+                  }
+                }
+              }
+            });
+          }
+        }
+      } catch {}
+    }
+    if (out.length) return out;
+
+    let uriList = '';
+    try {
+      uriList = dt.getData('application/vnd.code.uri-list') || '';
+    } catch {}
+    if (uriList && uriList.trim()) {
+      for (const line of uriList.split(/\r?\n/)) {
+        const u = line.trim();
+        if (!u || u.startsWith('#') || !/^file:\/\//i.test(u)) continue;
+        let label = u.split('/').pop() || u;
+        try {
+          label = decodeURIComponent(label);
+        } catch {}
+        out.push({
+          kind: 'file',
+          label,
+          scopeItem: {
+            $typeName: 'exa.codeium_common_pb.ContextScopeItem',
+            scopeItem: {
+              case: 'file',
+              value: {
+                $typeName: 'exa.codeium_common_pb.FileScopeItem',
+                absoluteUri: u
+              }
+            }
+          }
+        });
+      }
+    }
+    return out;
+  }
+
+  /* Bridge native pointer-dragged Pinned Sidebar rows (`[data-testid="conversation-row-sidebar"]`) into composers */
+  let pinnedDragState = null;
+  function clearPinnedComposerDropHighlights() {
+    document
+      .querySelectorAll('#antigravity\\.agentSidePanelInputBox[data-ag-convo-drop], [data-ag-pd-composer-box][data-drag="convo"]')
+      .forEach((el) => {
+        el.removeAttribute('data-ag-convo-drop');
+        if (el.getAttribute('data-drag') === 'convo') el.removeAttribute('data-drag');
+      });
+  }
+  function findComposerUnderPoint(x, y) {
+    const pdBox = document.querySelector('#ag-claude-projects-view:not([hidden]) [data-ag-pd-composer-box]');
+    if (pdBox) {
+      const r = pdBox.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        return { kind: 'project', el: pdBox };
+      }
+    }
+    const nativeBoxes = document.querySelectorAll('[id="antigravity.agentSidePanelInputBox"]');
+    for (const box of nativeBoxes) {
+      const r = box.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        return { kind: 'native', el: box };
+      }
+    }
+    return null;
+  }
+  const onPinnedRowPointerDown = (ev) => {
+    if (disposed || ev.button !== 0) return;
+    if (
+      ev.target &&
+      ev.target.closest &&
+      ev.target.closest('button, input, textarea, [contenteditable="true"], .agy-row-actions')
+    ) {
+      return;
+    }
+    const row = ev.target && ev.target.closest && ev.target.closest('[data-testid="conversation-row-sidebar"][data-cascade-id]');
+    if (!row) return;
+    const cid = row.getAttribute('data-cascade-id');
+    if (!cid) return;
+    const a = row.querySelector('a[href]');
+    const span = row.querySelector('.flex-col > span');
+    const title =
+      (span && span.textContent && span.textContent.trim()) ||
+      (a && a.getAttribute('aria-label')) ||
+      cid.slice(0, 8);
+    pinnedDragState = { id: cid, title, startX: ev.clientX, startY: ev.clientY, active: false };
+  };
+  const onPinnedRowPointerMove = (ev) => {
+    if (!pinnedDragState || disposed) return;
+    const dx = ev.clientX - pinnedDragState.startX;
+    const dy = ev.clientY - pinnedDragState.startY;
+    if (!pinnedDragState.active && dx * dx + dy * dy < 49) return;
+    pinnedDragState.active = true;
+    clearPinnedComposerDropHighlights();
+    const hit = findComposerUnderPoint(ev.clientX, ev.clientY);
+    if (!hit) return;
+    if (hit.kind === 'project') {
+      hit.el.setAttribute('data-drag', 'convo');
+    } else if (hit.kind === 'native') {
+      const viewEl = hit.el.closest('[data-testid="conversation-view"]');
+      const targetCid = viewEl && viewEl.getAttribute('data-cascade-id');
+      if (!targetCid || targetCid !== pinnedDragState.id) {
+        hit.el.setAttribute('data-ag-convo-drop', 'true');
+      }
+    }
+  };
+  const onPinnedRowPointerUp = (ev) => {
+    if (!pinnedDragState) return;
+    const st = pinnedDragState;
+    pinnedDragState = null;
+    clearPinnedComposerDropHighlights();
+    if (!st.active || disposed) return;
+    const hit = findComposerUnderPoint(ev.clientX, ev.clientY);
+    if (!hit) return;
+    if (hit.kind === 'project') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      try {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      } catch {}
+      const projView = document.getElementById('ag-claude-projects-view');
+      const projId = projView && projView.getAttribute('data-ag-pd-proj-id');
+      const compInput = hit.el.querySelector('#ag-pd-composer-input');
+      if (projId && compInput) {
+        appendDroppedMentionsToPdComposer({ id: projId }, compInput, [
+          {
+            kind: 'conversation',
+            label: st.title,
+            scopeItem: {
+              $typeName: 'exa.codeium_common_pb.ContextScopeItem',
+              scopeItem: {
+                case: 'conversation',
+                value: {
+                  $typeName: 'exa.codeium_common_pb.ConversationScopeItem',
+                  id: st.id,
+                  title: st.title,
+                  source: ''
+                }
+              }
+            }
+          }
+        ]);
+      }
+      return;
+    }
+    if (hit.kind === 'native') {
+      const viewEl = hit.el.closest('[data-testid="conversation-view"]');
+      const targetCid = viewEl && viewEl.getAttribute('data-cascade-id');
+      if (targetCid && targetCid === st.id) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      try {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      } catch {}
+      const bindings = findSidebarBindings();
+      if (targetCid && bindings && bindings.store && typeof bindings.store.dispatch === 'function') {
+        bindings.store.dispatch({
+          type: 'layout/setPendingChatDrop',
+          payload: {
+            cascadeId: targetCid,
+            payload: { type: 'conversation', conversationId: st.id, title: st.title }
+          }
+        });
+        return;
+      }
+      try {
+        if (typeof DataTransfer === 'function' && typeof DragEvent === 'function') {
+          const dt = new DataTransfer();
+          attachConversationDragTransfer(dt, st.id, st.title);
+          hit.el.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+        }
+      } catch {}
+    }
+  };
+  const onPinnedRowPointerCancel = () => {
+    pinnedDragState = null;
+    clearPinnedComposerDropHighlights();
+  };
+  document.addEventListener('pointerdown', onPinnedRowPointerDown, true);
+  window.addEventListener('pointermove', onPinnedRowPointerMove, true);
+  window.addEventListener('pointerup', onPinnedRowPointerUp, true);
+  window.addEventListener('pointercancel', onPinnedRowPointerCancel, true);
   let recentCollapsed = (() => {
     try {
       if (trustLocalOverrides && typeof localStorage === 'object' && localStorage) {
@@ -4903,6 +5235,7 @@
         }
         const row = ev.target && ev.target.closest && ev.target.closest('[data-ag-recent-id]');
         if (row) {
+          if (Date.now() - recentLastDragEndTs < 260) return;
           const cid = row.getAttribute('data-ag-recent-id');
           if (recentRenamingId && recentRenamingId === cid) return;
           closeRecentRowMenu();
@@ -4910,6 +5243,33 @@
           navigateSidebarConversation(cid, curBindings);
           scheduleSidebarSync();
         }
+      });
+      sec.addEventListener('dragstart', (ev) => {
+        if (
+          ev.target &&
+          ev.target.closest &&
+          ev.target.closest('[data-ag-recent-pin], [data-ag-recent-menu], [data-ag-recent-rename-input]')
+        ) {
+          ev.preventDefault();
+          return;
+        }
+        const row = ev.target && ev.target.closest && ev.target.closest('[data-ag-recent-id]');
+        if (!row) return;
+        const cid = row.getAttribute('data-ag-recent-id');
+        if (!cid || (recentRenamingId && recentRenamingId === cid)) {
+          ev.preventDefault();
+          return;
+        }
+        const item = recentItemsById.get(cid);
+        const title = (item && item.title) || row.getAttribute('data-ag-recent-title') || '';
+        attachConversationDragTransfer(ev.dataTransfer, cid, title);
+        row.setAttribute('data-dragging', 'true');
+      });
+      sec.addEventListener('dragend', (ev) => {
+        recentLastDragEndTs = Date.now();
+        const row = ev.target && ev.target.closest && ev.target.closest('[data-ag-recent-id]');
+        if (row) row.removeAttribute('data-dragging');
+        sec.querySelectorAll('[data-dragging="true"]').forEach((n) => n.removeAttribute('data-dragging'));
       });
       sec.addEventListener('contextmenu', (ev) => {
         if (sec.getAttribute('data-mode') !== 'unified') return;
@@ -5015,7 +5375,7 @@
               const mainInner = isRenaming
                 ? `<input type="text" class="ag-recent-rename-input" data-ag-recent-rename-input="${escapeHtml(it.id)}" data-orig-title="${escapeHtml(it.title)}" value="${escapeHtml(it.title)}" />`
                 : `<div class="ag-recent-title">${escapeHtml(it.title)}</div>`;
-              return `<div class="ag-recent-row" role="button" tabindex="0" data-ag-recent-id="${escapeHtml(it.id)}" data-active="${isAct ? 'true' : 'false'}"${it.project ? ` data-has-project="true"` : ''}${isRenaming ? ' data-renaming="true"' : ''} title="${escapeHtml(tip)}"><div class="ag-recent-main">${mainInner}</div>${isRenaming ? '' : `<div class="ag-recent-side">${sideHtml}</div>${actionsHtml}`}</div>`;
+              return `<div class="ag-recent-row" role="button" tabindex="0"${isRenaming ? '' : ' draggable="true"'} data-ag-recent-id="${escapeHtml(it.id)}" data-ag-recent-title="${escapeHtml(it.title)}" data-active="${isAct ? 'true' : 'false'}"${it.project ? ` data-has-project="true"` : ''}${isRenaming ? ' data-renaming="true"' : ''} title="${escapeHtml(tip)}"><div class="ag-recent-main">${mainInner}</div>${isRenaming ? '' : `<div class="ag-recent-side">${sideHtml}</div>${actionsHtml}`}</div>`;
             })
             .join('')}</div>` + moreHtml
         : `<div class="ag-recent-empty">${escapeHtml(L('暂无最近对话', 'No recent conversations'))}</div>`;
@@ -5078,9 +5438,9 @@
    *       text nodes & title/placeholder/aria-label attributes with zero page reload.
    * ========================================================================== */
   const UX_I18N_BASE_EXCLUDE =
-    'code, pre, kbd, samp, textarea, input, style, script, noscript, [contenteditable="true"], [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, .monaco-editor, .monaco-diff-editor, .xterm, [class*="onyx-key"], .prose, .markdown, [class*="chat-message"], [class*="group/file-title"], [data-testid="conversation-row-sidebar"] a[href^="/c/"], [data-testid="conversation-row-sidebar"] span.truncate, [data-testid="conversation-navigator-turn"], .msg-body, #raw, [data-testid="swarm-raw"], #swarm-title, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="model-selector-menu"], [data-testid="permissions-selector-trigger"]';
+    'code, pre, kbd, samp, textarea, input, style, script, noscript, [contenteditable="true"], [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, [data-testid="skill-scope-item-pill"], bdi.context-scope-mention, .monaco-editor, .monaco-diff-editor, .xterm, [class*="onyx-key"], .prose, .markdown, [class*="chat-message"], [class*="group/file-title"], [data-testid="conversation-row-sidebar"] a[href^="/c/"], [data-testid="conversation-row-sidebar"] span.truncate, [data-testid="conversation-navigator-turn"], .msg-body, #raw, [data-testid="swarm-raw"], #swarm-title, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="model-selector-menu"], [data-testid="permissions-selector-trigger"]';
   const UX_I18N_ATTR_EXCLUDE =
-    'code, pre, kbd, samp, style, script, noscript, [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, .monaco-editor, .monaco-diff-editor, .xterm, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="permissions-selector-trigger"]';
+    'code, pre, kbd, samp, style, script, noscript, [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, [data-testid="skill-scope-item-pill"], bdi.context-scope-mention, .monaco-editor, .monaco-diff-editor, .xterm, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="permissions-selector-trigger"]';
   let uxI18nObserver = null;
   let uxI18nFlushTimer = 0;
   let uxI18nDirtyRoots = new Set();
@@ -6895,6 +7255,55 @@
     compInput.dispatchEvent(new Event('input', { bubbles: true }));
   }
 
+  function appendDroppedMentionsToPdComposer(project, compInput, items) {
+    if (!project || !compInput || !Array.isArray(items) || !items.length) return;
+    const mMap = getProjectMentionMap(project.id, true);
+    let curVal = compInput.value || '';
+    for (const item of items) {
+      if (!item || !item.scopeItem) continue;
+      const cleanLabel = String(item.label || '').replace(/[\[\]\r\n]+/g, ' ').trim() || 'item';
+      const token = `@[${cleanLabel}]`;
+      mMap.set(token, {
+        token,
+        label: cleanLabel,
+        kind: item.kind || 'conversation',
+        logo: item.logo || '',
+        scopeItem: item.scopeItem
+      });
+      if (!curVal.includes(token)) {
+        const sep = curVal && !/\s$/.test(curVal) ? ' ' : '';
+        curVal = `${curVal}${sep}${token} `;
+      }
+    }
+    compInput.value = curVal;
+    compInput.focus();
+    try {
+      compInput.setSelectionRange(curVal.length, curVal.length);
+    } catch {}
+    compInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  const PD_INLINE_URL_RE = /(?<![\w./@-])(?:https?:\/\/|www\.)[^\s<>"'`]*[^\s<>"'`.,;:!?)\]}]/g;
+  function openUrlAtTextareaCaret(textarea) {
+    if (!textarea || typeof textarea.selectionStart !== 'number') return false;
+    const text = textarea.value || '';
+    const pos = textarea.selectionStart;
+    PD_INLINE_URL_RE.lastIndex = 0;
+    let m;
+    while ((m = PD_INLINE_URL_RE.exec(text)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (pos >= start && pos <= end) {
+        const url = m[0].startsWith('www.') ? `https://${m[0]}` : m[0];
+        try {
+          window.open(url, '_blank', 'noopener,noreferrer');
+        } catch {}
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function updatePdMentionMenuForInput(project, compInput) {
     if (!project || !compInput) {
       closePdMentionMenu();
@@ -8400,7 +8809,7 @@
               ? `<span class="ag-pd-chat-pin" title="${escapeHtml(L('已置顶', 'Pinned'))}">${RECENT_PIN_SVG}</span>`
               : '';
             const timeTxt = c.lastSec ? formatProjectTimeAgo(c.lastSec) : '';
-            return `<button type="button" class="ag-pd-chat-row" data-ag-pd-chat="${escapeHtml(c.id)}">
+            return `<button type="button" class="ag-pd-chat-row" draggable="true" data-ag-pd-chat="${escapeHtml(c.id)}" data-ag-pd-chat-title="${escapeHtml(c.title)}">
               <div class="ag-pd-chat-main">
                 <span class="ag-pd-chat-title">${statusDot}${pinBadge}${escapeHtml(c.title)}</span>
               </div>
@@ -8426,7 +8835,7 @@
             const modeTag = f.inlined
               ? `<span class="ag-pm-tag ag-pm-tag-inline">${L('自动内联', 'Inline')}</span>`
               : `<span class="ag-pm-tag">${L('按需读取', 'On-demand')}</span>`;
-            return `<div class="ag-pd-file-row">
+            return `<div class="ag-pd-file-row" draggable="true" data-ag-pd-drag-file="${escapeHtml(f.absPath || '')}">
               <button type="button" class="ag-pd-file-name" data-ag-pd-reveal-file="${escapeHtml(f.absPath || '')}" title="${escapeHtml(f.absPath || f.name)}">${escapeHtml(f.name)}</button>
               <span class="ag-pd-file-meta">${modeTag}<span>${escapeHtml(f.sizeText || '')}</span></span>
               <button type="button" class="ag-pd-file-del" data-ag-pd-rm-file="${escapeHtml(f.relPath)}" aria-label="${escapeHtml(L('移除文件', 'Remove file'))}">×</button>
@@ -8806,7 +9215,13 @@
         syncSend();
         updatePdMentionMenuForInput(project, compInput);
       });
-      compInput.addEventListener('click', () => {
+      compInput.addEventListener('click', (e) => {
+        if (e.metaKey || e.ctrlKey) {
+          if (openUrlAtTextareaCaret(compInput)) {
+            e.preventDefault();
+            return;
+          }
+        }
         updatePdMentionMenuForInput(project, compInput);
       });
       compInput.addEventListener('paste', (e) => {
@@ -8818,8 +9233,15 @@
       });
       if (compBox) {
         compBox.addEventListener('dragover', (e) => {
-          if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+          const dt = e.dataTransfer;
+          if (
+            dt &&
+            (Array.from(dt.types || []).includes('Files') || hasDroppedContextPayload(dt))
+          ) {
             e.preventDefault();
+            try {
+              dt.dropEffect = 'copy';
+            } catch {}
             compBox.setAttribute('data-drag', 'true');
           }
         });
@@ -8830,6 +9252,13 @@
         });
         compBox.addEventListener('drop', (e) => {
           compBox.removeAttribute('data-drag');
+          const droppedMentions = extractDroppedContextMentions(e.dataTransfer);
+          if (droppedMentions.length > 0) {
+            e.preventDefault();
+            e.stopPropagation();
+            appendDroppedMentionsToPdComposer(project, compInput, droppedMentions);
+            return;
+          }
           const imgs = extractComposerImageFiles(e.dataTransfer);
           if (!imgs.length) return;
           e.preventDefault();
@@ -8873,9 +9302,36 @@
       sendBtn.addEventListener('click', dispatchPrompt);
     }
 
+    let pdLastDragEndTs = 0;
     el.querySelectorAll('[data-ag-pd-chat]').forEach((btn) => {
       btn.addEventListener('click', () => {
+        if (Date.now() - pdLastDragEndTs < 260) return;
         openConversationFromProject(btn.getAttribute('data-ag-pd-chat'));
+      });
+      btn.addEventListener('dragstart', (e) => {
+        const cid = btn.getAttribute('data-ag-pd-chat');
+        const title = btn.getAttribute('data-ag-pd-chat-title') || '';
+        attachConversationDragTransfer(e.dataTransfer, cid, title);
+        btn.setAttribute('data-dragging', 'true');
+      });
+      btn.addEventListener('dragend', () => {
+        pdLastDragEndTs = Date.now();
+        btn.removeAttribute('data-dragging');
+      });
+    });
+
+    el.querySelectorAll('[data-ag-pd-drag-file]').forEach((row) => {
+      row.addEventListener('dragstart', (e) => {
+        if (e.target && e.target.closest && e.target.closest('[data-ag-pd-rm-file]')) {
+          e.preventDefault();
+          return;
+        }
+        const abs = row.getAttribute('data-ag-pd-drag-file');
+        if (!abs) {
+          e.preventDefault();
+          return;
+        }
+        attachFileDragTransfer(e.dataTransfer, abs);
       });
     });
 
@@ -10998,6 +11454,11 @@
     document.removeEventListener('mouseenter', onMetricsPillMouseEnter, true);
     document.removeEventListener('mouseleave', onMetricsPillMouseLeave, true);
     document.removeEventListener('click', onMetricsPillClick, true);
+    document.removeEventListener('pointerdown', onPinnedRowPointerDown, true);
+    window.removeEventListener('pointermove', onPinnedRowPointerMove, true);
+    window.removeEventListener('pointerup', onPinnedRowPointerUp, true);
+    window.removeEventListener('pointercancel', onPinnedRowPointerCancel, true);
+    clearPinnedComposerDropHighlights();
     window.removeEventListener('resize', onWindowResizePopover);
     window.removeEventListener('focus', onWindowSidebarEvent);
     window.removeEventListener('blur', onWindowSidebarEvent);

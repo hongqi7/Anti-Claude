@@ -197,15 +197,59 @@ body[data-agy-font] :where(.font-sans),
   font-size: 15.5px !important;
 }
 
-/* User message bubbles: keep calibrated sans-serif 14px / 1.6 */
+/* User message bubbles: keep calibrated sans-serif 14px / 1.6 (excluding compact mention/skill pills & links) */
 :is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble),
-:is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) :is(p, span, div, li, .select-text):not(code):not(pre):not(.font-mono) {
+:is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) :is(p, span, div, li, .select-text):not(code):not(pre):not(.font-mono):not([data-testid="skill-scope-item-pill"]):not([data-testid="skill-scope-item-pill"] *):not(bdi.context-scope-mention *) {
   font-family: var(--font-sans) !important;
   font-size: 14px !important;
   font-weight: 400 !important;
   line-height: 1.6 !important;
   letter-spacing: 0 !important;
   -webkit-font-smoothing: antialiased !important;
+}
+
+/* v2.34+ Auto-linked URLs in Lexical composer & user bubbles + clickable Skill pills */
+[data-lexical-editor="true"] :is(a.text-link, a[href]),
+[data-lexical-editor="true"] :is(a.text-link, a[href]) span[data-lexical-text="true"],
+#antigravity\.agentSidePanelInputBox [data-lexical-editor="true"] :is(a.text-link, a[href]),
+#antigravity\.agentSidePanelInputBox [data-lexical-editor="true"] :is(a.text-link, a[href]) span[data-lexical-text="true"],
+:is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) a[href],
+:is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) a[href] span {
+  color: var(--ag-accent, #2F75C3) !important;
+  text-decoration-line: underline !important;
+  text-decoration-thickness: 1px !important;
+  text-underline-offset: 2.5px !important;
+  cursor: pointer !important;
+}
+
+.dark [data-lexical-editor="true"] :is(a.text-link, a[href]),
+.dark [data-lexical-editor="true"] :is(a.text-link, a[href]) span[data-lexical-text="true"],
+.dark #antigravity\.agentSidePanelInputBox [data-lexical-editor="true"] :is(a.text-link, a[href]),
+.dark #antigravity\.agentSidePanelInputBox [data-lexical-editor="true"] :is(a.text-link, a[href]) span[data-lexical-text="true"],
+.dark :is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) a[href],
+.dark :is([data-testid="user-input-step"], [data-testid="user-message-content"], .agy-user-bubble) a[href] span {
+  color: #6EA8FE !important;
+}
+
+[data-testid="skill-scope-item-pill"],
+bdi.context-scope-mention [role="button"][data-uri] {
+  cursor: pointer !important;
+  pointer-events: auto !important;
+}
+
+.ag-recent-row[draggable="true"],
+.ag-pd-chat-row[draggable="true"] {
+  -webkit-user-drag: element;
+}
+
+.ag-recent-row[data-dragging="true"],
+.ag-pd-chat-row[data-dragging="true"] {
+  opacity: 0.55 !important;
+}
+
+#antigravity\.agentSidePanelInputBox[data-ag-convo-drop="true"] {
+  box-shadow: 0 0 0 2px rgba(47, 117, 195, 0.48) !important;
+  border-radius: 14px !important;
 }
 
 /* Editable inputs & Lexical composer: bypass size-adjust font & autospace/trim so macOS Dictation IME caret stays aligned */
