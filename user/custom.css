@@ -1940,6 +1940,58 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cm-row:is(:hover, [dat
   color: #5E9EFF !important;
 }
 
+/* --- Long Code Block Folding & Sticky Header (claudeUxCodeFold) --- */
+[data-ag-code-wrap="true"] > div.min-h-7:first-child {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 3 !important;
+  background-color: inherit !important;
+  border-top-left-radius: inherit !important;
+  border-top-right-radius: inherit !important;
+}
+
+[data-ag-code-collapsed="true"] > div.p-3 {
+  max-height: 352px !important;
+  overflow: hidden !important;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent) !important;
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent) !important;
+}
+
+.ag-code-fold-toggle svg {
+  transition: transform 160ms ease !important;
+}
+
+[data-ag-code-collapsed="false"] .ag-code-fold-toggle svg {
+  transform: rotate(180deg) !important;
+}
+
+.ag-code-fold-bar {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 30px !important;
+  padding: 0 12px !important;
+  margin: 0 !important;
+  border: none !important;
+  border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent) !important;
+  border-bottom-left-radius: inherit !important;
+  border-bottom-right-radius: inherit !important;
+  background: transparent !important;
+  cursor: pointer !important;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif !important;
+  font-size: 12.5px !important;
+  white-space: normal !important;
+  color: inherit !important;
+  opacity: 0.68 !important;
+  transition: opacity 120ms ease, background-color 120ms ease !important;
+}
+
+.ag-code-fold-bar:hover {
+  opacity: 1 !important;
+  background-color: color-mix(in srgb, currentColor 5%, transparent) !important;
+}
+
 #antigravity\.agentSidePanelInputBox #ag-claude-ctx-ring {
   display: inline-flex !important;
   align-items: center !important;

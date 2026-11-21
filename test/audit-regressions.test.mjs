@@ -2240,3 +2240,78 @@ test('[v2.34.0 Orchestrator Planners & Thinking Effort] unlocks thinking effort 
     window.close();
   }
 });
+
+test('[Code Fold & Sticky Header] collapses native code blocks over 40 lines, remembers expand across remount, and leaves short blocks untouched', { skip: skipDom }, async () => {
+  const customCssSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.css'), 'utf8');
+  assert.match(
+    customCssSrc,
+    /\[data-ag-code-wrap="true"\]\s*>\s*div\.min-h-7:first-child\s*\{[^}]*position:\s*sticky/,
+    'custom.css pins native code block headers via sticky positioning'
+  );
+
+  const makeCodeBlockHtml = (lang, lines, prefix) => {
+    const rows = Array.from({ length: lines }, (_, i) =>
+      `<div class="code-line" data-line-number="${i + 1}"><span>${prefix} line ${i + 1}</span></div>`
+    ).join('');
+    return (
+      `<div class="relative whitespace-pre-wrap word-break-all my-2 rounded-xl bg-muted border">` +
+      `<div class="min-h-7 relative box-border flex flex-row items-center justify-between rounded-t border-b border-border px-2 py-0.5">` +
+      `<div class="font-sans text-base text-muted-foreground">${lang}</div>` +
+      `<div class="flex flex-row items-center gap-2 justify-end"><button type="button" aria-label="Copy code"></button></div>` +
+      `</div>` +
+      `<div class="p-3"><div class="code-block w-full text-sm cursor-text" dir="ltr"><div class="flex flex-col w-full">${rows}</div></div></div>` +
+      `</div>`
+    );
+  };
+
+  const longHtml = makeCodeBlockHtml('js', 60, 'const alpha =');
+  const shortHtml = makeCodeBlockHtml('js', 5, 'const beta =');
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body><div id="root"><div data-testid="planner-response-text" id="resp">${longHtml}${shortHtml}</div></div></body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-code', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  window.ctx = { modules: { i18n: false, claudeUxCodeFold: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    await new Promise((r) => setTimeout(r, 30));
+    const resp = doc.getElementById('resp');
+    const longWrap = resp.children[0];
+    const shortWrap = resp.children[1];
+
+    /* 1. Long block (>=40 lines) is collapsed by default with toggle + expand bar */
+    assert.equal(longWrap.getAttribute('data-ag-code-wrap'), 'true');
+    assert.equal(longWrap.getAttribute('data-ag-code-long'), 'true');
+    assert.equal(longWrap.getAttribute('data-ag-code-collapsed'), 'true');
+    assert.ok(longWrap.querySelector('.ag-code-fold-toggle'), 'header fold toggle button mounted');
+    const bar = longWrap.querySelector('.ag-code-fold-bar');
+    assert.ok(bar && /60/.test(bar.textContent), 'bottom expand bar displays total line count (60)');
+
+    /* 2. Short block (<40 lines) gets sticky wrapper attr only */
+    assert.equal(shortWrap.getAttribute('data-ag-code-wrap'), 'true');
+    assert.equal(shortWrap.hasAttribute('data-ag-code-long'), false);
+    assert.equal(shortWrap.querySelector('.ag-code-fold-toggle'), null);
+    assert.equal(shortWrap.querySelector('.ag-code-fold-bar'), null);
+
+    /* 3. Expanding updates state & bar text */
+    bar.click();
+    assert.equal(longWrap.getAttribute('data-ag-code-collapsed'), 'false');
+    assert.equal(bar.textContent, 'Collapse code');
+
+    /* 4. Unmounting and remounting identical block remembers expanded state */
+    longWrap.remove();
+    resp.insertAdjacentHTML('afterbegin', longHtml);
+    await new Promise((r) => setTimeout(r, 180));
+    const remountedWrap = resp.children[0];
+    assert.equal(remountedWrap.getAttribute('data-ag-code-collapsed'), 'false', 'remount preserves user expanded state');
+
+    /* 5. Clicking header toggle collapses block back */
+    remountedWrap.querySelector('.ag-code-fold-toggle').click();
+    assert.equal(remountedWrap.getAttribute('data-ag-code-collapsed'), 'true');
+  } finally {
+    window.close();
+  }
+});

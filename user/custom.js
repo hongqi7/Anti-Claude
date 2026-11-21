@@ -80,7 +80,8 @@
     recentSection: effectiveModBool('claudeUxRecentSection', false),
     projects: effectiveModBool('claudeUxProjects', true),
     hideSidebarProjects: effectiveModBool('claudeUxHideSidebarProjects', true),
-    customizations: effectiveModBool('claudeUxCustomizations', true)
+    customizations: effectiveModBool('claudeUxCustomizations', true),
+    codeFold: effectiveModBool('claudeUxCodeFold', true)
   };
   const L = (zh, en) => (FEAT.i18n ? zh : en);
 
@@ -1238,6 +1239,185 @@
     }
   }
 
+  /* ==========================================================================
+   * 4b. Long Code Block Folding & Sticky Header (claudeUxCodeFold)
+   *     - Sticks native code block headers while scrolling long responses
+   *     - Collapses blocks with >= 40 lines to a preview by default, remembering
+   *       user expand/collapse choices across React virtualized remounts
+   * ========================================================================== */
+  const CODE_FOLD_MIN_LINES = 40;
+  const CODE_FOLD_KEYS_MAX = 300;
+  const codeFoldUserState = new Map();
+  const SVG_CODE_FOLD_CHEVRON =
+    '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+    '<path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '</svg>';
+
+  function findNativeCodeBlocks() {
+    const blocks = [];
+    const codeEls = document.querySelectorAll('div.code-block');
+    for (const codeEl of codeEls) {
+      if (codeEl.classList.contains('overflow-y-auto')) continue;
+      const body = codeEl.parentElement;
+      if (!body || !body.classList || !body.classList.contains('p-3')) continue;
+      const wrap = body.parentElement;
+      if (!wrap) continue;
+      const header = wrap.firstElementChild;
+      if (!header || header === body || !header.classList) continue;
+      if (!header.classList.contains('min-h-7') || !header.classList.contains('border-b')) continue;
+      blocks.push({ wrap, header, body, codeEl });
+    }
+    return blocks;
+  }
+
+  function codeBlockLineCount(codeEl) {
+    if (!codeEl) return 0;
+    const lineNodes = codeEl.querySelectorAll('.code-line');
+    if (lineNodes.length > 0) return lineNodes.length;
+    const txt = codeEl.textContent || '';
+    return txt ? txt.split('\n').length : 0;
+  }
+
+  function codeBlockKey(header, codeEl) {
+    const langEl = header && header.firstElementChild;
+    const lang = langEl && langEl.textContent ? langEl.textContent.trim() : '';
+    const snippet = codeEl && codeEl.textContent ? codeEl.textContent.slice(0, 160) : '';
+    return `${lang}|${snippet}`;
+  }
+
+  function rememberCodeFoldState(key, stateVal) {
+    if (codeFoldUserState.has(key)) codeFoldUserState.delete(key);
+    codeFoldUserState.set(key, stateVal);
+    if (codeFoldUserState.size > CODE_FOLD_KEYS_MAX) {
+      codeFoldUserState.delete(codeFoldUserState.keys().next().value);
+    }
+  }
+
+  function findCodeBlockScrollContainer(el) {
+    let cur = el ? el.parentElement : null;
+    for (let i = 0; i < 25 && cur && cur !== document.documentElement; i++, cur = cur.parentElement) {
+      if (typeof getComputedStyle === 'function') {
+        const ov = getComputedStyle(cur).overflowY;
+        if (ov === 'auto' || ov === 'scroll') return cur;
+      }
+    }
+    return null;
+  }
+
+  function onCodeFoldClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const trigger = e.currentTarget;
+    const wrap = trigger && trigger.closest ? trigger.closest('[data-ag-code-wrap]') : null;
+    if (wrap) toggleCodeFold(wrap);
+  }
+
+  function syncSingleCodeBlock(wrap, header, codeEl) {
+    if (!wrap || !header || !codeEl) return;
+    if (wrap.getAttribute('data-ag-code-wrap') !== 'true') {
+      wrap.setAttribute('data-ag-code-wrap', 'true');
+    }
+    const lines = codeBlockLineCount(codeEl);
+    if (lines >= CODE_FOLD_MIN_LINES) {
+      if (wrap.getAttribute('data-ag-code-long') !== 'true') {
+        wrap.setAttribute('data-ag-code-long', 'true');
+      }
+      const key = codeBlockKey(header, codeEl);
+      const collapsed = codeFoldUserState.get(key) !== 'expanded';
+      const nextAttr = collapsed ? 'true' : 'false';
+      if (wrap.getAttribute('data-ag-code-collapsed') !== nextAttr) {
+        wrap.setAttribute('data-ag-code-collapsed', nextAttr);
+      }
+
+      let toggleBtn = header.querySelector('.ag-code-fold-toggle');
+      if (!toggleBtn) {
+        toggleBtn = document.createElement('button');
+        toggleBtn.type = 'button';
+        toggleBtn.className =
+          'ag-code-fold-toggle appearance-none bg-transparent border-0 p-0 cursor-pointer text-secondary-foreground hover:text-foreground transition-colors';
+        toggleBtn.setAttribute('data-ag-i18n-ignore', '1');
+        toggleBtn.innerHTML = SVG_CODE_FOLD_CHEVRON;
+        toggleBtn.addEventListener('click', onCodeFoldClick);
+        const btnGroup =
+          header.lastElementChild && header.lastElementChild !== header.firstElementChild
+            ? header.lastElementChild
+            : header;
+        btnGroup.insertBefore(toggleBtn, btnGroup.firstChild);
+      }
+      const toggleLabel = collapsed ? L('展开代码', 'Expand code') : L('收起代码', 'Collapse code');
+      if (toggleBtn.getAttribute('aria-label') !== toggleLabel) {
+        toggleBtn.setAttribute('aria-label', toggleLabel);
+      }
+      if (toggleBtn.getAttribute('title') !== toggleLabel) {
+        toggleBtn.setAttribute('title', toggleLabel);
+      }
+
+      let bar = null;
+      for (const ch of wrap.children) {
+        if (ch.classList && ch.classList.contains('ag-code-fold-bar')) {
+          bar = ch;
+          break;
+        }
+      }
+      if (!bar) {
+        bar = document.createElement('button');
+        bar.type = 'button';
+        bar.className = 'ag-code-fold-bar';
+        bar.setAttribute('data-ag-i18n-ignore', '1');
+        bar.addEventListener('click', onCodeFoldClick);
+        wrap.appendChild(bar);
+      }
+      const barText = collapsed
+        ? L(`展开全部 · 共 ${lines} 行`, `Show all ${lines} lines`)
+        : L('收起代码', 'Collapse code');
+      if (bar.textContent !== barText) {
+        bar.textContent = barText;
+      }
+    } else {
+      if (wrap.hasAttribute('data-ag-code-long')) wrap.removeAttribute('data-ag-code-long');
+      if (wrap.hasAttribute('data-ag-code-collapsed')) wrap.removeAttribute('data-ag-code-collapsed');
+      header.querySelectorAll('.ag-code-fold-toggle').forEach((n) => n.remove());
+      for (const ch of Array.from(wrap.children)) {
+        if (ch.classList && ch.classList.contains('ag-code-fold-bar')) ch.remove();
+      }
+    }
+  }
+
+  function toggleCodeFold(wrap) {
+    const header = wrap.firstElementChild;
+    const codeEl = wrap.querySelector(':scope > div.p-3 > div.code-block');
+    if (!header || !codeEl) return;
+    const key = codeBlockKey(header, codeEl);
+    const nextCollapsed = wrap.getAttribute('data-ag-code-collapsed') !== 'true';
+    rememberCodeFoldState(key, nextCollapsed ? 'collapsed' : 'expanded');
+    syncSingleCodeBlock(wrap, header, codeEl);
+    if (nextCollapsed) {
+      try {
+        const scroller = findCodeBlockScrollContainer(wrap);
+        const minTop = scroller ? scroller.getBoundingClientRect().top : 0;
+        if (wrap.getBoundingClientRect().top < minTop) {
+          wrap.scrollIntoView({ block: 'start', behavior: 'auto' });
+        }
+      } catch {}
+    }
+  }
+
+  function syncCodeBlocks() {
+    if (!FEAT.codeFold) return;
+    for (const { wrap, header, codeEl } of findNativeCodeBlocks()) {
+      syncSingleCodeBlock(wrap, header, codeEl);
+    }
+  }
+
+  function teardownCodeBlocks() {
+    document.querySelectorAll('[data-ag-code-wrap]').forEach((wrap) => {
+      wrap.removeAttribute('data-ag-code-wrap');
+      wrap.removeAttribute('data-ag-code-long');
+      wrap.removeAttribute('data-ag-code-collapsed');
+    });
+    document.querySelectorAll('.ag-code-fold-toggle, .ag-code-fold-bar').forEach((el) => el.remove());
+  }
+
   let lastSyncTs = 0;
   function syncStepStream() {
     rafPending = false;
@@ -1265,6 +1445,7 @@
     syncTodoCards(panes);
     syncRunningToolIndicators(panes);
     syncInlinePillBoundaries();
+    syncCodeBlocks();
     if (FEAT.contextRing) {
       ensureMetricsWrapped();
       ensureComposerContextRing();
@@ -6143,6 +6324,14 @@
           'Smooth Tool Panel Collapse',
           '收拢工具详情面板时补齐 190ms 丝滑过渡动画',
           'Adds a 190ms smooth collapse transition when closing tool detail panels'
+        ],
+        [
+          'claudeUxCodeFold',
+          'codeFold',
+          '长代码块折叠与顶栏吸顶',
+          'Long Code Folding & Sticky Header',
+          '超过 40 行的代码块默认收起为预览并可一键展开，滚动时语言名与复制按钮保持吸顶',
+          'Collapses code blocks over 40 lines into a preview with one-click expand, and pins the language label & copy button while scrolling'
         ]
       ]
     },
@@ -6334,6 +6523,8 @@
       document.querySelectorAll('.ag-orbit-dots, .ag-elapsed-timer').forEach((n) => n.remove());
     } else if (featKey === 'inlineUndo' && !on) {
       closeInlineEdit(false);
+    } else if (featKey === 'codeFold' && !on) {
+      teardownCodeBlocks();
     }
     syncSidebarEnhancements();
     scheduleSync();
@@ -11612,7 +11803,7 @@
   }
 
   const OWN_SEL =
-    '.ag-claude-todo-card, .ag-claude-todo-live-dock, .ag-collapse-ghost, .ag-orbit-dots, .ag-elapsed-timer, #ag-claude-ctx-ring, #ag-claude-quota-popover, #ag-claude-model-popover, #ag-claude-model-subpop, .ag-claude-inline-editor, .ag-claude-folder-badges, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-settings-stats-wrap, .ag-settings-subhdr-chev, #ag-claude-projects-nav-btn, #ag-claude-projects-view, #ag-claude-project-modal';
+    '.ag-claude-todo-card, .ag-claude-todo-live-dock, .ag-collapse-ghost, .ag-orbit-dots, .ag-elapsed-timer, #ag-claude-ctx-ring, #ag-claude-quota-popover, #ag-claude-model-popover, #ag-claude-model-subpop, .ag-claude-inline-editor, .ag-claude-folder-badges, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-settings-stats-wrap, .ag-settings-subhdr-chev, #ag-claude-projects-nav-btn, #ag-claude-projects-view, #ag-claude-project-modal, .ag-code-fold-toggle, .ag-code-fold-bar';
   const CLASS_WATCH_SEL =
     'ul.contains-task-list, [id="antigravity.agentSidePanelInputBox"], [data-testid="tool-group-collapsible"], [data-testid="worked-for-collapsible"], [data-testid="progress-updates-collapsible"], [data-testid="ephemeral-tool-status"]';
 
@@ -11731,6 +11922,9 @@
     projectComposerDrafts.clear();
     observer.disconnect();
     stopUxI18nObserver();
+    try {
+      teardownCodeBlocks();
+    } catch {}
     for (const id of pendingRafs) cancelAnimationFrame(id);
     pendingRafs.clear();
     for (const id of pendingTimeouts) clearTimeout(id);

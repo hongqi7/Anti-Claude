@@ -95,7 +95,8 @@ const ALLOWED_UI_MODULE_KEYS = new Set([
   'claudeUxRecentSection',
   'claudeUxProjects',
   'claudeUxHideSidebarProjects',
-  'claudeUxCustomizations'
+  'claudeUxCustomizations',
+  'claudeUxCodeFold'
 ]);
 const VALID_CJK_SCALES = new Set(['94.5', '95', '100']);
 const INLINE_TEXT_EXTS = new Set([
