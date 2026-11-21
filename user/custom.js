@@ -2843,6 +2843,82 @@
     }
   }
 
+  function isOrchestratorModelOpt(opt) {
+    if (!opt) return false;
+    const id = typeof opt.modelId === 'string' ? opt.modelId : '';
+    if (
+      id === 'gemini-pro-coordinator' ||
+      id === 'gemini-pro-orchestrator' ||
+      id.startsWith('gemini-pro-orchestrator-')
+    ) {
+      return true;
+    }
+    return /orchestrator|编排器/i.test(String(opt.label || ''));
+  }
+
+  function parseModelLabelEffort(rawLabel) {
+    const normalizedLabel = String(rawLabel || '')
+      .replace(/编排器\s*\(([^)]+)\)/g, 'Orchestrator ($1)')
+      .replace(/\s*\(Extra High\)\s*$/i, ' (XHigh)');
+    const m = normalizedLabel.match(EFFORT_LABEL_RE);
+    const baseName = m ? m[1].trim() : normalizedLabel.trim();
+    const effort = m ? EFFORT_NORM[m[2].toLowerCase()] || m[2] : null;
+    return { baseName, effort };
+  }
+
+  function matchPlannerFromTriggerText(rawText, planners) {
+    let txt = String(rawText || '').trim().replace(/\s+/g, ' ');
+    if (!txt) return null;
+    txt = txt
+      .replace(/^Select model,\s*current:\s*/i, '')
+      .replace(/\s*·\s*[^·]*$/, '')
+      .trim();
+    if (!/^(?:Orchestrator|编排器)\s+/i.test(txt)) return null;
+    txt = txt.replace(/^(?:Orchestrator|编排器)\s+/i, '').trim();
+    const m = txt.match(/^(.*?)\s+(Low|Medium|High|Extra High|XHigh|Extra|Max)$/i);
+    const wantedBase = (m ? m[1] : txt).trim().toLowerCase();
+    const rawEff = m ? m[2].toLowerCase() : '';
+    const wantedEff = rawEff ? (rawEff === 'extra high' ? 'XHigh' : EFFORT_NORM[rawEff] || m[2]) : null;
+    if (!wantedBase) return null;
+    let baseMatch = null;
+    for (const p of planners) {
+      const parsed = parseModelLabelEffort(p.label);
+      if (parsed.baseName.toLowerCase() !== wantedBase) continue;
+      if (wantedEff && parsed.effort === wantedEff) return p;
+      if (!baseMatch) baseMatch = p;
+    }
+    return baseMatch;
+  }
+
+  function resolveActiveOrchestratorPlanner(api, planners) {
+    if (!Array.isArray(planners) || !planners.length) return null;
+    const pickVal = api && api.orchestratorPick ? api.orchestratorPick.model : undefined;
+    if (pickVal && pickVal !== 0) {
+      const byPick = planners.find((p) => p.value === pickVal);
+      if (byPick) return byPick;
+    }
+    const nativeBtn = document.querySelector('button[data-testid="model-selector-trigger"]');
+    if (nativeBtn) {
+      const candidates = [nativeBtn.getAttribute('aria-label'), nativeBtn.textContent];
+      for (const raw of candidates) {
+        const matched = matchPlannerFromTriggerText(raw, planners);
+        if (matched) return matched;
+      }
+    }
+    const defPlanner = api && api.orchestratorDefaultPlanner;
+    if (defPlanner) {
+      const byDef =
+        planners.find(
+          (p) =>
+            (defPlanner.value !== undefined && p.value === defPlanner.value) ||
+            (defPlanner.modelId && p.modelId === defPlanner.modelId) ||
+            (defPlanner.label && p.label === defPlanner.label)
+        ) || null;
+      if (byDef) return byDef;
+    }
+    return planners[0];
+  }
+
   function buildReduxModelSelectorApi() {
     try {
       const { store } = resolveProjectsStoreAndBindings();
@@ -2886,12 +2962,24 @@
         customModels.find((m) => m.value === defVal) ||
         modelOptions.find((m) => !m.disabled) ||
         modelOptions[0];
+      const orchMap = (st && st.modelSelection && st.modelSelection.orchestratorByConversation) || {};
+      const draftOrchModel = orchMap[''] !== undefined ? orchMap[''] : 0;
       return {
         modelOptions,
         customModels,
         selectedModel,
         open: false,
         setIsOpen: () => {},
+        orchestratorPick: {
+          model: draftOrchModel,
+          select: (modelVal) => {
+            if (modelVal === undefined || typeof store.dispatch !== 'function') return;
+            store.dispatch({
+              type: 'modelSelection/orchestratorModelPicked',
+              payload: { model: modelVal }
+            });
+          }
+        },
         setSelectedModel: (opt) => {
           if (!opt || opt.value === undefined || typeof store.dispatch !== 'function') return;
           store.dispatch({
@@ -2914,17 +3002,20 @@
       (!btnEl && activeModelTriggerBtn && activeModelTriggerBtn.hasAttribute && activeModelTriggerBtn.hasAttribute('data-ag-pd-model-trigger'))
     );
     const nativeBtn = document.querySelector('button[data-testid="model-selector-trigger"]');
+    const isValidApi = (obj) =>
+      Boolean(obj && typeof obj === 'object' && typeof obj.setSelectedModel === 'function' && Array.isArray(obj.modelOptions) && obj.modelOptions.length > 0);
     const readNativeApi = (btn) => {
       if (!btn) return null;
       const fk = Object.keys(btn).find((k) => k.startsWith('__reactFiber$'));
       let f = fk ? btn[fk] : null;
-      for (let i = 0; i < 26 && f; i++, f = f.return) {
+      let fallback = null;
+      for (let i = 0; i < 28 && f; i++, f = f.return) {
         const p = f.memoizedProps;
-        if (p && typeof p.setSelectedModel === 'function' && Array.isArray(p.modelOptions) && p.modelOptions.length > 0) {
-          return p;
-        }
+        if (!p) continue;
+        if (isValidApi(p.value)) return p.value;
+        if (!fallback && isValidApi(p)) fallback = p;
       }
-      return null;
+      return fallback;
     };
 
     if (isProjectTrigger) {
@@ -2932,8 +3023,28 @@
       const nativeApi = readNativeApi(nativeBtn);
       if (reduxApi) {
         if (nativeApi) {
+          const reduxPick = reduxApi.orchestratorPick;
+          const nativePick = nativeApi.orchestratorPick;
+          const mergedPick =
+            (reduxPick && typeof reduxPick.select === 'function') || (nativePick && typeof nativePick.select === 'function')
+              ? {
+                  model: (reduxPick && reduxPick.model) || (nativePick && nativePick.model) || 0,
+                  select: (val) => {
+                    try {
+                      if (reduxPick && typeof reduxPick.select === 'function') reduxPick.select(val);
+                    } catch {}
+                    try {
+                      if (nativePick && typeof nativePick.select === 'function') nativePick.select(val);
+                    } catch {}
+                  }
+                }
+              : undefined;
           return {
             ...reduxApi,
+            orchestratorPlanners: nativeApi.orchestratorPlanners,
+            orchestratorPlannerIndex: nativeApi.orchestratorPlannerIndex,
+            orchestratorDefaultPlanner: nativeApi.orchestratorDefaultPlanner,
+            ...(mergedPick ? { orchestratorPick: mergedPick } : {}),
             setSelectedModel: (opt) => {
               reduxApi.setSelectedModel(opt);
               const match = nativeApi.modelOptions.find(
@@ -2997,8 +3108,24 @@
     }
   }
 
-  function applyModelSelectionOption(api, targetOpt) {
+  function applyModelSelectionOption(api, targetOpt, orchestratorPlannerOpt) {
     if (!targetOpt) return;
+    if (orchestratorPlannerOpt && orchestratorPlannerOpt.value !== undefined) {
+      if (api && api.orchestratorPick && typeof api.orchestratorPick.select === 'function') {
+        try {
+          api.orchestratorPick.select(orchestratorPlannerOpt.value);
+        } catch {}
+      }
+      try {
+        const { store } = resolveProjectsStoreAndBindings();
+        if (store && typeof store.dispatch === 'function') {
+          store.dispatch({
+            type: 'modelSelection/orchestratorModelPicked',
+            payload: { model: orchestratorPlannerOpt.value }
+          });
+        }
+      } catch {}
+    }
     if (api && typeof api.setSelectedModel === 'function') {
       try {
         api.setSelectedModel(targetOpt);
@@ -3031,12 +3158,28 @@
       : [];
     const allOpts = rawOpts.concat(customOpts);
 
+    const rawOrchOpts = rawOpts.filter(isOrchestratorModelOpt);
+    const canonicalOrchOpt =
+      (api.selectedModel && !api.selectedModel.disabled && isOrchestratorModelOpt(api.selectedModel) ? api.selectedModel : null) ||
+      rawOrchOpts[0] ||
+      (api.modelOptions || []).find(isOrchestratorModelOpt) ||
+      null;
+    const orchPlanners = Array.isArray(api.orchestratorPlanners)
+      ? api.orchestratorPlanners.filter((o) => o && !o.disabled && o.label)
+      : [];
+    const hasDynamicOrch = Boolean(
+      orchPlanners.length > 0 &&
+      canonicalOrchOpt &&
+      api.orchestratorPick &&
+      typeof api.orchestratorPick.select === 'function'
+    );
+
     const familyMap = new Map();
     for (const opt of allOpts) {
-      const normalizedLabel = String(opt.label).replace(/编排器\s*\(([^)]+)\)/g, 'Orchestrator ($1)');
-      const m = normalizedLabel.match(EFFORT_LABEL_RE);
-      const baseName = m ? m[1].trim() : normalizedLabel.trim();
-      const effort = m ? EFFORT_NORM[m[2].toLowerCase()] || m[2] : null;
+      if (hasDynamicOrch && isOrchestratorModelOpt(opt)) continue;
+      const parsed = parseModelLabelEffort(opt.label);
+      const baseName = parsed.baseName;
+      const effort = parsed.effort;
       let fam = familyMap.get(baseName);
       if (!fam) {
         fam = { baseName, variants: [] };
@@ -3053,8 +3196,31 @@
       });
     }
 
+    const orchFamilies = [];
+    if (hasDynamicOrch) {
+      const orchFamilyMap = new Map();
+      for (const p of orchPlanners) {
+        const parsed = parseModelLabelEffort(p.label);
+        const famName = `Orchestrator · ${parsed.baseName}`;
+        let fam = orchFamilyMap.get(famName);
+        if (!fam) {
+          fam = { baseName: famName, isOrchestratorFamily: true, variants: [] };
+          orchFamilyMap.set(famName, fam);
+        }
+        fam.variants.push({ effort: parsed.effort, opt: canonicalOrchOpt, plannerOpt: p });
+      }
+      for (const fam of orchFamilyMap.values()) {
+        fam.variants.sort((a, b) => {
+          const ra = a.effort && EFFORT_RANK[a.effort] !== undefined ? EFFORT_RANK[a.effort] : 99;
+          const rb = b.effort && EFFORT_RANK[b.effort] !== undefined ? EFFORT_RANK[b.effort] : 99;
+          return ra - rb;
+        });
+        orchFamilies.push(fam);
+      }
+    }
+
     const families = Array.from(familyMap.values());
-    const isOrch = (f) => /orchestrator/i.test(f.baseName);
+    const isOrch = (f) => Boolean(f && (f.isOrchestratorFamily || /orchestrator/i.test(f.baseName)));
     const isCoreGemini = (f) => /^gemini\b/i.test(f.baseName) && !isOrch(f);
 
     const coreRank = (name) => {
@@ -3072,12 +3238,15 @@
       .slice(0, 5);
 
     const primarySet = new Set(primaryFamilies);
-    const moreFamilies = families
+    const nonPrimaryEntries = families
       .filter((f) => !primarySet.has(f))
       .map((f) => ({
         group: isOrch(f) ? 'orch' : 'other',
         fam: f
-      }))
+      }));
+    const orchEntries = hasDynamicOrch ? orchFamilies.map((f) => ({ group: 'orch', fam: f })) : [];
+    const moreFamilies = orchEntries
+      .concat(nonPrimaryEntries)
       .sort((a, b) => (a.group === b.group ? 0 : a.group === 'orch' ? -1 : 1));
 
     const sel = api.selectedModel || null;
@@ -3085,19 +3254,42 @@
     let activeVariant = null;
 
     if (sel) {
-      for (const fam of families) {
-        for (const v of fam.variants) {
-          if (
-            (sel.value !== undefined && v.opt.value === sel.value) ||
-            (sel.modelId && v.opt.modelId === sel.modelId) ||
-            v.opt.label === sel.label
-          ) {
-            activeFamily = fam;
-            activeVariant = v;
-            break;
+      if (hasDynamicOrch && isOrchestratorModelOpt(sel)) {
+        const activePlanner = resolveActiveOrchestratorPlanner(api, orchPlanners);
+        if (activePlanner) {
+          for (const fam of orchFamilies) {
+            for (const v of fam.variants) {
+              const p = v.plannerOpt;
+              if (
+                p &&
+                ((activePlanner.value !== undefined && p.value === activePlanner.value) ||
+                  (activePlanner.modelId && p.modelId === activePlanner.modelId) ||
+                  p.label === activePlanner.label)
+              ) {
+                activeFamily = fam;
+                activeVariant = v;
+                break;
+              }
+            }
+            if (activeFamily) break;
           }
         }
-        if (activeFamily) break;
+      }
+      if (!activeFamily) {
+        for (const fam of families) {
+          for (const v of fam.variants) {
+            if (
+              (sel.value !== undefined && v.opt.value === sel.value) ||
+              (sel.modelId && v.opt.modelId === sel.modelId) ||
+              v.opt.label === sel.label
+            ) {
+              activeFamily = fam;
+              activeVariant = v;
+              break;
+            }
+          }
+          if (activeFamily) break;
+        }
       }
     }
 
@@ -3122,14 +3314,14 @@
     if (!fam || !fam.variants.length) return null;
     if (desiredEffort) {
       const exact = fam.variants.find((v) => v.effort === desiredEffort);
-      if (exact) return exact.opt;
+      if (exact) return exact;
       if (desiredEffort === 'XHigh' || desiredEffort === 'Max') {
         const high = fam.variants.find((v) => v.effort === 'High');
-        if (high) return high.opt;
+        if (high) return high;
       }
     }
     const med = fam.variants.find((v) => v.effort === 'Medium');
-    return (med || fam.variants[0]).opt;
+    return med || fam.variants[0];
   }
 
   function ensureModelPopovers() {
@@ -3158,8 +3350,8 @@
           if (api) {
             const cat = buildModelCatalog(api);
             const fam = cat.primaryFamilies.find((f) => f.baseName === baseName);
-            const targetOpt = pickVariantForFamily(fam, lastPreferredEffort);
-            if (targetOpt) applyModelSelectionOption(api, targetOpt);
+            const targetVar = pickVariantForFamily(fam, lastPreferredEffort);
+            if (targetVar && targetVar.opt) applyModelSelectionOption(api, targetVar.opt, targetVar.plannerOpt);
           }
           closeClaudeModelPopover();
           return;
@@ -3193,7 +3385,7 @@
               const v = cat.activeFamily.variants.find((x) => x.effort === eff);
               if (v && v.opt) {
                 lastPreferredEffort = eff;
-                applyModelSelectionOption(api, v.opt);
+                applyModelSelectionOption(api, v.opt, v.plannerOpt);
               }
             }
           }
@@ -3207,8 +3399,8 @@
           if (api) {
             const cat = buildModelCatalog(api);
             const entry = cat.moreFamilies.find((x) => x.fam.baseName === baseName);
-            const targetOpt = entry ? pickVariantForFamily(entry.fam, lastPreferredEffort) : null;
-            if (targetOpt) applyModelSelectionOption(api, targetOpt);
+            const targetVar = entry ? pickVariantForFamily(entry.fam, lastPreferredEffort) : null;
+            if (targetVar && targetVar.opt) applyModelSelectionOption(api, targetVar.opt, targetVar.plannerOpt);
           }
           closeClaudeModelPopover();
         }
@@ -3245,7 +3437,7 @@
 
     if (subPop && subPop.getAttribute('data-open') === 'true') {
       const mr = mainPop.getBoundingClientRect();
-      const subW = 236;
+      const subW = 272;
       let subLeft = Math.round(mr.right + 6);
       if (subLeft + subW > window.innerWidth - 10) {
         subLeft = Math.max(10, Math.round(mr.left - subW - 6));
@@ -3356,7 +3548,7 @@
           return `${hdr}<button type="button" class="ag-cm-row" style="min-height:34px;font-size:13.5px;" data-ag-cm-more-family="${escapeHtml(
             fam.baseName
           )}">
-            <span>${escapeHtml(fam.baseName)}</span>
+            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(fam.baseName)}</span>
             ${on ? SVG_CM_CHECK : ''}
           </button>`;
         })
@@ -3627,8 +3819,8 @@
         const fam = cat.primaryFamilies[idx];
         if (fam) {
           stop();
-          const targetOpt = pickVariantForFamily(fam, lastPreferredEffort);
-          if (targetOpt) applyModelSelectionOption(api, targetOpt);
+          const targetVar = pickVariantForFamily(fam, lastPreferredEffort);
+          if (targetVar && targetVar.opt) applyModelSelectionOption(api, targetVar.opt, targetVar.plannerOpt);
           closeClaudeModelPopover({ returnFocus: true });
         }
       }
@@ -4299,7 +4491,60 @@
 
   /* Bridge native pointer-dragged Pinned Sidebar rows (`[data-testid="conversation-row-sidebar"]`) into composers */
   let pinnedDragState = null;
-  function clearPinnedComposerDropHighlights() {
+  let pinnedDragOverCid = null;
+  let pinnedDragGhostEl = null;
+  function getLayoutReduxStore() {
+    const bindings = findSidebarBindings();
+    if (bindings && bindings.store && typeof bindings.store.dispatch === 'function') {
+      return bindings.store;
+    }
+    return null;
+  }
+  function setPinnedChatDragOverTarget(nextCid) {
+    const normalized = nextCid || null;
+    if (pinnedDragOverCid === normalized) return;
+    pinnedDragOverCid = normalized;
+    const store = getLayoutReduxStore();
+    if (store) {
+      try {
+        store.dispatch({ type: 'layout/setDragOverChatCascadeId', payload: normalized });
+        if (normalized) {
+          store.dispatch({ type: 'layout/setPendingSplitDrop', payload: null });
+        }
+      } catch {}
+    }
+  }
+  function removePinnedDragGhost() {
+    if (pinnedDragGhostEl) {
+      try {
+        pinnedDragGhostEl.remove();
+      } catch {}
+      pinnedDragGhostEl = null;
+    }
+    if (docRoot) docRoot.removeAttribute('data-ag-pinned-ghost-active');
+  }
+  function updatePinnedDragGhost(st, x, y) {
+    if (!st || x <= st.sidebarRight - 8 || !document.body) {
+      removePinnedDragGhost();
+      return;
+    }
+    if (!pinnedDragGhostEl) {
+      const ghost = document.createElement('div');
+      ghost.id = 'ag-pinned-drag-ghost';
+      ghost.className = 'ag-pinned-drag-ghost';
+      ghost.setAttribute('aria-hidden', 'true');
+      ghost.setAttribute('data-ag-i18n-ignore', '1');
+      ghost.innerHTML = `<span class="ag-pinned-drag-ghost-title">${escapeHtml(st.title)}</span><span class="ag-pinned-drag-ghost-pin">${RECENT_PIN_SVG}</span>`;
+      document.body.appendChild(ghost);
+      pinnedDragGhostEl = ghost;
+    }
+    if (docRoot) docRoot.setAttribute('data-ag-pinned-ghost-active', 'true');
+    pinnedDragGhostEl.style.width = `${st.rowWidth}px`;
+    pinnedDragGhostEl.style.transform = `translate3d(${Math.round(x - st.grabOffsetX)}px, ${Math.round(y - st.grabOffsetY)}px, 0)`;
+  }
+  function clearPinnedDropZoneHighlightOnly() {
+    if (docRoot) docRoot.removeAttribute('data-ag-pinned-chat-drop');
+    setPinnedChatDragOverTarget(null);
     document
       .querySelectorAll('#antigravity\\.agentSidePanelInputBox[data-ag-convo-drop], [data-ag-pd-composer-box][data-drag="convo"]')
       .forEach((el) => {
@@ -4307,25 +4552,42 @@
         if (el.getAttribute('data-drag') === 'convo') el.removeAttribute('data-drag');
       });
   }
+  function clearPinnedComposerDropHighlights() {
+    clearPinnedDropZoneHighlightOnly();
+    removePinnedDragGhost();
+  }
   function findComposerUnderPoint(x, y) {
-    const pdBox = document.querySelector('#ag-claude-projects-view:not([hidden]) [data-ag-pd-composer-box]');
-    if (pdBox) {
-      const r = pdBox.getBoundingClientRect();
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        return { kind: 'project', el: pdBox };
+    const pdView = document.querySelector('#ag-claude-projects-view:not([hidden])');
+    if (pdView) {
+      const pdBox = pdView.querySelector('[data-ag-pd-composer-box]');
+      if (pdBox) {
+        const pdLeft = pdBox.closest('.ag-pd-left') || pdBox;
+        const r = pdLeft.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+          return { kind: 'project', el: pdBox };
+        }
+      }
+    }
+    const views = document.querySelectorAll('[data-testid="conversation-view"]');
+    for (const view of views) {
+      const r = view.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        const box = view.querySelector('[id="antigravity.agentSidePanelInputBox"]') || view;
+        return { kind: 'native', el: box, viewEl: view, targetCid: view.getAttribute('data-cascade-id') || '' };
       }
     }
     const nativeBoxes = document.querySelectorAll('[id="antigravity.agentSidePanelInputBox"]');
     for (const box of nativeBoxes) {
       const r = box.getBoundingClientRect();
       if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        return { kind: 'native', el: box };
+        const viewEl = box.closest('[data-testid="conversation-view"]');
+        return { kind: 'native', el: box, viewEl, targetCid: (viewEl && viewEl.getAttribute('data-cascade-id')) || '' };
       }
     }
     return null;
   }
   const onPinnedRowPointerDown = (ev) => {
-    if (disposed || ev.button !== 0) return;
+    if (disposed || ev.button !== 0 || ev.altKey) return;
     if (
       ev.target &&
       ev.target.closest &&
@@ -4343,23 +4605,64 @@
       (span && span.textContent && span.textContent.trim()) ||
       (a && a.getAttribute('aria-label')) ||
       cid.slice(0, 8);
-    pinnedDragState = { id: cid, title, startX: ev.clientX, startY: ev.clientY, active: false };
+    const rowRect = row.getBoundingClientRect();
+    const sbEl = row.closest('.bg-sidebar');
+    const sbRect = sbEl ? sbEl.getBoundingClientRect() : null;
+    pinnedDragState = {
+      id: cid,
+      title,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      active: false,
+      grabOffsetX: rowRect.width > 0 ? Math.max(12, Math.min(rowRect.width - 12, ev.clientX - rowRect.left)) : 48,
+      grabOffsetY: rowRect.height > 0 ? Math.max(8, Math.min(rowRect.height - 8, ev.clientY - rowRect.top)) : 16,
+      rowWidth: rowRect.width > 0 ? Math.max(168, Math.min(248, Math.round(rowRect.width))) : 216,
+      sidebarRight: sbRect && sbRect.width > 0 ? sbRect.right : rowRect.right || 256
+    };
   };
   const onPinnedRowPointerMove = (ev) => {
     if (!pinnedDragState || disposed) return;
+    if (ev.altKey) {
+      clearPinnedComposerDropHighlights();
+      return;
+    }
     const dx = ev.clientX - pinnedDragState.startX;
     const dy = ev.clientY - pinnedDragState.startY;
     if (!pinnedDragState.active && dx * dx + dy * dy < 49) return;
     pinnedDragState.active = true;
-    clearPinnedComposerDropHighlights();
+    updatePinnedDragGhost(pinnedDragState, ev.clientX, ev.clientY);
     const hit = findComposerUnderPoint(ev.clientX, ev.clientY);
-    if (!hit) return;
+    if (!hit) {
+      clearPinnedDropZoneHighlightOnly();
+      return;
+    }
     if (hit.kind === 'project') {
+      if (docRoot) docRoot.setAttribute('data-ag-pinned-chat-drop', 'true');
+      setPinnedChatDragOverTarget(null);
       hit.el.setAttribute('data-drag', 'convo');
     } else if (hit.kind === 'native') {
-      const viewEl = hit.el.closest('[data-testid="conversation-view"]');
-      const targetCid = viewEl && viewEl.getAttribute('data-cascade-id');
-      if (!targetCid || targetCid !== pinnedDragState.id) {
+      const targetCid = hit.targetCid || '';
+      if (targetCid && targetCid === pinnedDragState.id) {
+        clearPinnedDropZoneHighlightOnly();
+        return;
+      }
+      if (docRoot) docRoot.setAttribute('data-ag-pinned-chat-drop', 'true');
+      if (targetCid) {
+        setPinnedChatDragOverTarget(targetCid);
+        const store = getLayoutReduxStore();
+        if (store) {
+          frame(() => {
+            if (pinnedDragState && pinnedDragOverCid === targetCid) {
+              try {
+                if (store.getState && store.getState().layout && store.getState().layout.pendingSplitDrop) {
+                  store.dispatch({ type: 'layout/setPendingSplitDrop', payload: null });
+                }
+              } catch {}
+            }
+          });
+        }
+      } else {
+        setPinnedChatDragOverTarget(null);
         hit.el.setAttribute('data-ag-convo-drop', 'true');
       }
     }
@@ -4369,7 +4672,7 @@
     const st = pinnedDragState;
     pinnedDragState = null;
     clearPinnedComposerDropHighlights();
-    if (!st.active || disposed) return;
+    if (!st.active || disposed || ev.altKey) return;
     const hit = findComposerUnderPoint(ev.clientX, ev.clientY);
     if (!hit) return;
     if (hit.kind === 'project') {
@@ -4404,17 +4707,17 @@
       return;
     }
     if (hit.kind === 'native') {
-      const viewEl = hit.el.closest('[data-testid="conversation-view"]');
-      const targetCid = viewEl && viewEl.getAttribute('data-cascade-id');
+      const targetCid = hit.targetCid || '';
       if (targetCid && targetCid === st.id) return;
       ev.preventDefault();
       ev.stopPropagation();
       try {
         window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
       } catch {}
-      const bindings = findSidebarBindings();
-      if (targetCid && bindings && bindings.store && typeof bindings.store.dispatch === 'function') {
-        bindings.store.dispatch({
+      const store = getLayoutReduxStore();
+      if (targetCid && store) {
+        store.dispatch({ type: 'layout/setPendingSplitDrop', payload: null });
+        store.dispatch({
           type: 'layout/setPendingChatDrop',
           payload: {
             cascadeId: targetCid,

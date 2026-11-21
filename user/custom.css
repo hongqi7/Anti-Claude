@@ -248,8 +248,68 @@ bdi.context-scope-mention [role="button"][data-uri] {
 }
 
 #antigravity\.agentSidePanelInputBox[data-ag-convo-drop="true"] {
-  box-shadow: 0 0 0 2px rgba(47, 117, 195, 0.48) !important;
+  box-shadow: 0 0 0 2px rgba(47, 117, 195, 0.55) !important;
+  background-color: rgba(47, 117, 195, 0.08) !important;
   border-radius: 14px !important;
+  transition: box-shadow 180ms ease, background-color 180ms ease !important;
+}
+
+/* Suppress competing split-pane preview portal while dragging a pinned conversation to cite into a chat dialog */
+html[data-ag-pinned-chat-drop="true"] body > div.fixed.pointer-events-none.bg-primary.opacity-15:not([data-testid]) {
+  display: none !important;
+}
+
+/* Floating cursor-following ghost card when dragging a Pinned Conversation out of the sidebar */
+.ag-pinned-drag-ghost {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  z-index: 9500 !important;
+  height: 33px !important;
+  padding: 0 10px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 8px !important;
+  border-radius: 10px !important;
+  background: rgba(249, 249, 248, 0.94) !important;
+  border: 1px solid rgba(20, 20, 19, 0.09) !important;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.13), 0 1px 4px rgba(0, 0, 0, 0.06) !important;
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+  color: #141413 !important;
+  font-family: var(--font-sans) !important;
+  font-size: 13.5px !important;
+  font-weight: 400 !important;
+  pointer-events: none !important;
+  user-select: none !important;
+  will-change: transform !important;
+}
+
+.dark .ag-pinned-drag-ghost {
+  background: rgba(40, 40, 38, 0.94) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42), 0 1px 4px rgba(0, 0, 0, 0.24) !important;
+  color: #ececea !important;
+}
+
+.ag-pinned-drag-ghost-title {
+  min-width: 0 !important;
+  flex: 1 1 auto !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+.ag-pinned-drag-ghost-pin {
+  flex: 0 0 auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  opacity: 0.48 !important;
+}
+
+html[data-ag-pinned-ghost-active="true"] [aria-hidden="true"].surface-opaque.pointer-events-none.bg-sidebar.shadow-lg {
+  opacity: 0 !important;
 }
 
 /* Editable inputs & Lexical composer: bypass size-adjust font & autospace/trim so macOS Dictation IME caret stays aligned */
@@ -1726,7 +1786,7 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) #antigravity\.agentSidePan
 }
 
 #ag-claude-model-subpop {
-  width: 236px !important;
+  width: 272px !important;
 }
 
 #ag-claude-model-subpop::before {
@@ -1791,6 +1851,7 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) :is(#ag-claude-model-popov
   display: flex !important;
   align-items: center !important;
   justify-content: space-between !important;
+  gap: 8px !important;
   width: 100% !important;
   min-height: 36px !important;
   padding: 6px 12px !important;

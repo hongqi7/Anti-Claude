@@ -1975,3 +1975,268 @@ test('[v2.34 Conversation Drag, URL Auto-Link & Skill Pill] supports dragging Un
     window.close();
   }
 });
+
+test('[Pinned Drag Drop Animation] dispatches layout/setDragOverChatCascadeId across conversation-view and suppresses competing split preview when dragging a Pinned row', { skip: skipDom }, async () => {
+  const customCssSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.css'), 'utf8');
+  assert.match(
+    customCssSrc,
+    /html\[data-ag-pinned-chat-drop="true"\]\s+body\s*>\s*div\.fixed\.pointer-events-none\.bg-primary\.opacity-15:not\(\[data-testid\]\)\s*\{\s*display:\s*none\s*!important;/,
+    'custom.css suppresses competing split-pane preview portal during pinned drag-to-cite'
+  );
+
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div class="bg-sidebar">
+          <div data-testid="conversation-list-sidebar">
+            <div class="w-full relative">
+              <div data-testid="conversation-row-sidebar" data-pinned="true" data-cascade-id="c-pin-other">
+                <a href="/c/c-pin-other" aria-label="Pinned Source Chat"></a>
+                <div class="flex-col"><span>Pinned Source Chat</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <main>
+          <div data-testid="conversation-view" data-cascade-id="c-active">
+            <div id="antigravity.agentSidePanelInputBox"></div>
+          </div>
+        </main>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-active', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+
+  const { window } = dom;
+  const doc = window.document;
+  const dispatches = [];
+  const storeState = {
+    layout: { dragOverChatCascadeId: null, pendingChatDrop: null, pendingSplitDrop: { paneId: 'p1', direction: 'right' } },
+    sidebarProjects: { projects: [] },
+    trajectorySummaries: { summaries: {}, indexes: { sidebar: [], pinned: ['c-pin-other'] } }
+  };
+  const mockStore = {
+    getState: () => storeState,
+    subscribe: () => () => {},
+    dispatch: (action) => dispatches.push(action)
+  };
+  doc.querySelector('[data-testid="conversation-list-sidebar"]').firstElementChild.__reactFiber$pin = {
+    memoizedProps: { sidebarStore: mockStore },
+    return: null
+  };
+  const sbEl = doc.querySelector('.bg-sidebar');
+  sbEl.getBoundingClientRect = () => ({ left: 0, top: 0, right: 256, bottom: 900, width: 256, height: 900 });
+  const pinnedRowEl = doc.querySelector('[data-testid="conversation-row-sidebar"][data-cascade-id="c-pin-other"]');
+  pinnedRowEl.getBoundingClientRect = () => ({ left: 8, top: 84, right: 244, bottom: 117, width: 236, height: 33 });
+  const viewEl = doc.querySelector('[data-testid="conversation-view"]');
+  viewEl.getBoundingClientRect = () => ({ left: 260, top: 40, right: 1200, bottom: 900, width: 940, height: 860 });
+
+  window.ctx = { modules: { i18n: false, claudeUxHideSidebarProjects: false }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    const pinnedRow = doc.querySelector('[data-testid="conversation-row-sidebar"][data-cascade-id="c-pin-other"]');
+    pinnedRow.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 80, clientY: 100 }));
+    window.dispatchEvent(new window.MouseEvent('pointermove', { bubbles: true, clientX: 500, clientY: 300 }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(doc.documentElement.getAttribute('data-ag-pinned-chat-drop'), 'true');
+    assert.equal(doc.documentElement.getAttribute('data-ag-pinned-ghost-active'), 'true');
+    const ghostEl = doc.getElementById('ag-pinned-drag-ghost');
+    assert.ok(ghostEl, 'mounts floating cursor-following ghost card when pinned row exits sidebar');
+    assert.match(ghostEl.textContent, /Pinned Source Chat/, 'ghost card displays pinned conversation title');
+    assert.match(ghostEl.style.transform, /^translate3d\(/, 'positions ghost card via translate3d');
+    assert.ok(
+      dispatches.some((a) => a.type === 'layout/setDragOverChatCascadeId' && a.payload === 'c-active'),
+      'triggers native Hgb+Igb drop highlight animation via setDragOverChatCascadeId'
+    );
+    assert.ok(
+      dispatches.some((a) => a.type === 'layout/setPendingSplitDrop' && a.payload === null),
+      'clears competing pendingSplitDrop highlight'
+    );
+
+    window.dispatchEvent(new window.MouseEvent('pointerup', { bubbles: true, button: 0, clientX: 500, clientY: 300 }));
+    assert.equal(doc.documentElement.getAttribute('data-ag-pinned-chat-drop'), null);
+    assert.equal(doc.documentElement.getAttribute('data-ag-pinned-ghost-active'), null);
+    assert.equal(doc.getElementById('ag-pinned-drag-ghost'), null, 'removes ghost card on drop');
+    assert.ok(
+      dispatches.some((a) => a.type === 'layout/setDragOverChatCascadeId' && a.payload === null),
+      'clears setDragOverChatCascadeId on drop'
+    );
+    assert.ok(
+      dispatches.some(
+        (a) =>
+          a.type === 'layout/setPendingChatDrop' &&
+          a.payload &&
+          a.payload.cascadeId === 'c-active' &&
+          a.payload.payload.conversationId === 'c-pin-other'
+      ),
+      'dispatches pendingChatDrop to cite pinned conversation'
+    );
+  } finally {
+    window.close();
+  }
+});
+
+test('[v2.34.0 Orchestrator Planners & Thinking Effort] unlocks thinking effort on Orchestrators and exposes Claude Opus 5.5 from v7c.Provider', { skip: skipDom }, async () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <button type="button" data-testid="model-selector-trigger" aria-label="Select model, current: Orchestrator Gemini 4 Neon Extra High">Orchestrator Gemini 4 Neon Extra</button>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-orch', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  const btn = doc.querySelector('button[data-testid="model-selector-trigger"]');
+  btn.getBoundingClientRect = () => ({ left: 40, top: 760, right: 240, bottom: 788, width: 200, height: 28 });
+
+  const modelOptions = [
+    { label: 'Gemini 4 Carbon (Low)', value: 1438, modelId: 'gemini-4-carbon-low', disabled: false },
+    { label: 'Gemini 4 Carbon (Medium)', value: 1437, modelId: 'gemini-4-carbon-medium', disabled: false },
+    { label: 'Gemini 4 Carbon (High)', value: 1427, modelId: 'gemini-4-carbon-high', disabled: false },
+    { label: 'Orchestrator (Neon)', value: 1537, modelId: 'gemini-pro-orchestrator-neon', disabled: false },
+    { label: 'Orchestrator (Carbon)', value: 1538, modelId: 'gemini-pro-orchestrator-carbon', disabled: false },
+    { label: 'Orchestrator (Argon)', value: 1539, modelId: 'gemini-pro-orchestrator-argon', disabled: false }
+  ];
+  const orchestratorPlanners = [
+    { label: 'Gemini 4 Neon (High)', value: 1532, modelId: 'gemini-4-neon-high', disabled: false },
+    { label: 'Gemini 4 Neon (XHigh)', value: 1535, modelId: 'gemini-4-neon-xhigh', disabled: false },
+    { label: 'Gemini 4 Neon (Medium)', value: 1533, modelId: 'gemini-4-neon-medium', disabled: false },
+    { label: 'Gemini 4 Neon (Low)', value: 1534, modelId: 'gemini-4-neon-low', disabled: false },
+    { label: 'Gemini 4 Carbon (Medium)', value: 1437, modelId: 'gemini-4-carbon-medium', disabled: false },
+    { label: 'Gemini 4 Carbon (High)', value: 1427, modelId: 'gemini-4-carbon-high', disabled: false },
+    { label: 'Gemini 4 Carbon (Low)', value: 1438, modelId: 'gemini-4-carbon-low', disabled: false },
+    { label: 'Gemini 4 Argon (Medium)', value: 1418, modelId: 'gemini-4-argon-medium', disabled: false },
+    { label: 'Gemini 4 Argon (High)', value: 1417, modelId: 'gemini-4-argon-high', disabled: false },
+    { label: 'Gemini 4 Argon (Low)', value: 1419, modelId: 'gemini-4-argon-low', disabled: false },
+    { label: 'Claude Opus 5.5 (Low)', value: 1400, modelId: 'claude-opus-5-5-low', disabled: false },
+    { label: 'Claude Opus 5.5 (Medium)', value: 1401, modelId: 'claude-opus-5-5-medium', disabled: false },
+    { label: 'Claude Opus 5.5 (High)', value: 1402, modelId: 'claude-opus-5-5-high', disabled: false }
+  ];
+
+  let selectedModel = modelOptions[3];
+  let orchPickModel = 0;
+  const calls = [];
+
+  const outerWrapperFiber = {
+    memoizedProps: {
+      modelOptions,
+      get selectedModel() {
+        return selectedModel;
+      },
+      setSelectedModel(o) {
+        calls.push(['setSelected', o && o.value]);
+        selectedModel = o;
+      }
+    },
+    return: null
+  };
+
+  btn.__reactFiber$orch = {
+    memoizedProps: {
+      value: {
+        modelOptions,
+        orchestratorPlanners,
+        orchestratorDefaultPlanner: { label: 'Gemini 4 Neon (XHigh)', value: 1535, modelId: 'gemini-4-neon-xhigh' },
+        orchestratorPick: {
+          get model() {
+            return orchPickModel;
+          },
+          select(v) {
+            calls.push(['orchSelect', v]);
+            orchPickModel = v;
+          }
+        },
+        get selectedModel() {
+          return selectedModel;
+        },
+        setSelectedModel(o) {
+          calls.push(['setSelected', o && o.value]);
+          selectedModel = o;
+        }
+      }
+    },
+    return: outerWrapperFiber
+  };
+
+  window.ctx = { modules: { i18n: false, claudeUxModelMenu: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+
+  try {
+    const openMenu = () => btn.dispatchEvent(new window.Event('pointerdown', { bubbles: true, cancelable: true }));
+
+    /* 1. Opening menu while on Neon Orchestrator with model:0 unlocks Thinking effort & shows Extra */
+    openMenu();
+    const mainPop = doc.getElementById('ag-claude-model-popover');
+    const subPop = doc.getElementById('ag-claude-model-subpop');
+    const effTrigger = mainPop.querySelector('[data-ag-cm-subtrigger="effort"]');
+    assert.notEqual(effTrigger.getAttribute('data-disabled'), 'true', 'Orchestrator thinking effort must not be disabled');
+    assert.match(effTrigger.textContent, /Extra/, 'displays default Neon XHigh as Extra');
+    assert.doesNotMatch(effTrigger.textContent, /固定|Fixed/);
+
+    effTrigger.click();
+    assert.equal(subPop.getAttribute('data-open'), 'true');
+    assert.deepEqual(
+      Array.from(subPop.querySelectorAll('[data-ag-cm-effort]')).map((el) => el.getAttribute('data-ag-cm-effort')),
+      ['Low', 'Medium', 'High', 'XHigh'],
+      'Neon Orchestrator offers all 4 thinking efforts'
+    );
+    assert.ok(subPop.querySelector('[data-ag-cm-effort="XHigh"] .ag-cm-check'), 'XHigh row is checked initially');
+
+    /* 2. Switching Neon Orchestrator effort to High dispatches orchestratorPick.select(1532) before setSelectedModel(1537) */
+    subPop.querySelector('[data-ag-cm-effort="High"]').click();
+    assert.deepEqual(calls, [
+      ['orchSelect', 1532],
+      ['setSelected', 1537]
+    ]);
+
+    /* 3. More models lists all 4 dynamic Orchestrator planners including Claude Opus 5.5 without legacy duplicates */
+    openMenu();
+    mainPop.querySelector('[data-ag-cm-subtrigger="more"]').click();
+    const moreLabels = Array.from(subPop.querySelectorAll('[data-ag-cm-more-family]')).map((el) =>
+      el.getAttribute('data-ag-cm-more-family')
+    );
+    assert.deepEqual(moreLabels, [
+      'Orchestrator · Gemini 4 Neon',
+      'Orchestrator · Gemini 4 Carbon',
+      'Orchestrator · Gemini 4 Argon',
+      'Orchestrator · Claude Opus 5.5'
+    ]);
+
+    /* 4. Selecting Claude Opus 5.5 inherits High effort, calls select(1402), and exposes Low/Medium/High only */
+    calls.length = 0;
+    subPop.querySelector('[data-ag-cm-more-family="Orchestrator · Claude Opus 5.5"]').click();
+    assert.deepEqual(calls, [
+      ['orchSelect', 1402],
+      ['setSelected', 1537]
+    ]);
+
+    openMenu();
+    assert.match(mainPop.querySelector('[data-ag-cm-subtrigger="effort"]').textContent, /High/);
+    mainPop.querySelector('[data-ag-cm-subtrigger="effort"]').click();
+    assert.match(subPop.querySelector('.ag-cm-sec-hdr').textContent, /Orchestrator · Claude Opus 5\.5/);
+    assert.deepEqual(
+      Array.from(subPop.querySelectorAll('[data-ag-cm-effort]')).map((el) => el.getAttribute('data-ag-cm-effort')),
+      ['Low', 'Medium', 'High'],
+      'Claude Opus 5.5 Orchestrator offers Low/Medium/High efforts'
+    );
+    calls.length = 0;
+    subPop.querySelector('[data-ag-cm-effort="Low"]').click();
+    assert.deepEqual(calls, [
+      ['orchSelect', 1400],
+      ['setSelected', 1537]
+    ]);
+
+    /* 5. Switching back to a standard primary model invokes setSelectedModel only */
+    calls.length = 0;
+    openMenu();
+    mainPop.querySelector('[data-ag-cm-family="Gemini 4 Carbon"]').click();
+    assert.deepEqual(calls, [['setSelected', 1438]]);
+  } finally {
+    window.close();
+  }
+});
