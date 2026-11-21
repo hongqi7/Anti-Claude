@@ -10,7 +10,7 @@ Only run these steps when the user **explicitly asks to install, update, or unin
 The installer changes user config (`~/.gemini/antigravity/anti-claude/user/` files, `product_skin`, `verboseConversationSteps`, a rule block in `~/.gemini/AGENTS.md`) and records every change for rollback. Tell the user this before running it.
 
 ## Prerequisites
-- Google Antigravity Desktop 2.0 (`v2.30+`, tested through `v2.33.0+`) on macOS, Windows, or Linux (or Antigravity CLI `agy` via `--cli-only`)
+- Google Antigravity Desktop 2.0 (`v2.30+`, tested through `v2.34.0`) on macOS, Windows, or Linux (or Antigravity CLI `agy` via `--cli-only`)
 - Node.js `>= 22`
 
 ## 1-Step Installation (Fresh Install or Update to Latest)

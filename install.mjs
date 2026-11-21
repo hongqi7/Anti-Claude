@@ -141,7 +141,7 @@ function readProcessCommandLineSync(pid) {
     }
   }
   try {
-    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+    return execFileSync('ps', ['-ww', '-p', String(pid), '-o', 'command='], {
       encoding: 'utf8',
       timeout: 1500,
       stdio: ['ignore', 'pipe', 'ignore']
@@ -163,11 +163,43 @@ export function isMatchingDaemonPid(pid, pattern = /(?:^|[\\/ "'])daemon\.mjs(?:
   return Boolean(cmd && pattern.test(cmd));
 }
 
+function resolveAtomicWriteTarget(p) {
+  try {
+    const lst = fs.lstatSync(p);
+    if (lst.isSymbolicLink()) {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return path.resolve(path.dirname(p), fs.readlinkSync(p));
+      }
+    }
+  } catch {}
+  return p;
+}
+
 function writeFileAtomic(p, content) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, content, 'utf8');
-  fs.renameSync(tmp, p);
+  const target = resolveAtomicWriteTarget(p);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let prevMode = null;
+  try {
+    const st = fs.statSync(target, { throwIfNoEntry: false });
+    if (st && st.isFile()) prevMode = st.mode & 0o777;
+  } catch {}
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    fs.writeFileSync(tmp, content, prevMode !== null ? { encoding: 'utf8', mode: prevMode } : 'utf8');
+    if (prevMode !== null) {
+      try {
+        fs.chmodSync(tmp, prevMode);
+      } catch {}
+    }
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
 }
 
 function writeJsonAtomic(p, obj) {
@@ -660,9 +692,48 @@ function retireLegacyThemePatch(state) {
   return out;
 }
 
+function recoverStateFromDisk() {
+  const hasBase = fs.existsSync(BASE_DIR);
+  const hasBackup = fs.existsSync(BACKUP_DIR);
+  if (!hasBase && !hasBackup) return null;
+  const recovered = newState();
+  let foundAny = false;
+  for (const f of USER_LAYER_FILES) {
+    const baseFile = path.join(BASE_DIR, f);
+    const bakFile = path.join(BACKUP_DIR, f);
+    const hasBaseFile = fs.existsSync(baseFile);
+    const hasBakFile = fs.existsSync(bakFile);
+    if (!hasBaseFile && !hasBakFile) continue;
+    foundAny = true;
+    recovered.files[f] = {
+      existedBefore: hasBakFile,
+      deployedSha: hasBaseFile ? sha256File(baseFile) : ''
+    };
+  }
+  const cliBase = path.join(BASE_DIR, AGY_CLI_STATUSLINE_NAME);
+  const cliBak = path.join(BACKUP_DIR, AGY_CLI_STATUSLINE_NAME);
+  if (fs.existsSync(cliBase) || fs.existsSync(cliBak)) {
+    foundAny = true;
+    recovered.cli.statusLineScript = {
+      existedBefore: fs.existsSync(cliBak),
+      deployedSha: fs.existsSync(cliBase) ? sha256File(cliBase) : ''
+    };
+  }
+  return foundAny ? recovered : null;
+}
+
 function loadState() {
-  const st = readJsonSafe(STATE_FILE, null);
-  if (st && st.schema === STATE_SCHEMA) return st;
+  const raw = readTextSafe(STATE_FILE);
+  if (raw !== null) {
+    const st = readJsonSafe(STATE_FILE, null);
+    if (st && st.schema === STATE_SCHEMA) return st;
+    /* Preserve corrupt or incompatible state file instead of silently treating as fresh install */
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      fs.writeFileSync(path.join(STATE_DIR, `install-state.corrupt-${ts}.json`), raw, 'utf8');
+    } catch {}
+    return migrateLegacyV2State() || migrateLegacyState() || recoverStateFromDisk();
+  }
   return migrateLegacyV2State() || migrateLegacyState();
 }
 
@@ -704,13 +775,25 @@ export function validateSourceRoot(root = __dirname) {
 function pullSelfRepoIfGit() {
   if (!fs.existsSync(path.join(__dirname, '.git'))) return { pulled: false, reason: 'not_git_checkout' };
   try {
-    const head = () => execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
-    const beforeHead = head();
+    const headShort = () => execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+    const headFull = () => execFileSync('git', ['-C', __dirname, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const beforeHead = headShort();
+    const beforeFullHead = headFull();
     execFileSync('git', ['-C', __dirname, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 20000 });
-    const afterHead = head();
-    return { pulled: true, updated: beforeHead !== afterHead, beforeHead, afterHead };
+    const afterHead = headShort();
+    return { pulled: true, updated: beforeHead !== afterHead, beforeHead, beforeFullHead, afterHead };
   } catch (err) {
     return { pulled: false, error: String(err?.stderr || err?.message || err).split('\n')[0] };
+  }
+}
+
+function rollbackSelfRepo(targetSha) {
+  if (!targetSha || !/^[0-9a-f]{7,40}$/i.test(targetSha)) return false;
+  try {
+    execFileSync('git', ['-C', __dirname, 'reset', '--hard', targetSha], { stdio: 'pipe', timeout: 10000 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1023,14 +1106,25 @@ function installUserLayer(state, { sourceRoot = __dirname, overwriteLocal = fals
     let entry = state.files[f];
 
     if (!entry) {
-      if (localText !== null) {
-        fs.mkdirSync(BACKUP_DIR, { recursive: true });
-        fs.writeFileSync(path.join(BACKUP_DIR, f), localText, 'utf8');
+      const bakPath = path.join(BACKUP_DIR, f);
+      const baseText = readTextSafe(path.join(BASE_DIR, f));
+      const bakAlreadyExists = fs.existsSync(bakPath);
+      if (bakAlreadyExists || baseText !== null) {
+        /* Never overwrite an existing pre-install backup or treat our own deployed base as a user backup */
+        entry = state.files[f] = {
+          existedBefore: bakAlreadyExists,
+          deployedSha: baseText !== null ? sha256Text(baseText) : ''
+        };
+      } else {
+        if (localText !== null) {
+          fs.mkdirSync(BACKUP_DIR, { recursive: true });
+          fs.writeFileSync(bakPath, localText, 'utf8');
+        }
+        entry = state.files[f] = { existedBefore: localText !== null, deployedSha: '' };
+        deployFile(f, srcText, state);
+        result.created.push(f);
+        continue;
       }
-      entry = state.files[f] = { existedBefore: localText !== null, deployedSha: '' };
-      deployFile(f, srcText, state);
-      result.created.push(f);
-      continue;
     }
     if (localText === null) {
       deployFile(f, srcText, state);
@@ -1151,7 +1245,7 @@ function cleanupUninstallExtras(state) {
         if (!entry.isDirectory()) continue;
         const scDir = path.join(SIDECARS_DIR, entry.name);
         const sc = readJsonSafe(path.join(scDir, 'sidecar.json'), null);
-        if (entry.name.startsWith('ac-') || sc?.created_by === 'anti-claude') {
+        if (sc?.created_by === 'anti-claude' || typeof sc?.anti_claude_project_dir === 'string') {
           fs.rmSync(scDir, { recursive: true, force: true });
           sidecarsRemoved.push(entry.name);
         }
@@ -1262,14 +1356,51 @@ function getLinuxSystemdUnitPath() {
   return path.join(HOME, '.config', 'systemd', 'user', 'anti-claude-daemon.service');
 }
 
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
+  }
+}
+
+function waitForActiveRelaunchWindow(maxWaitMs = 5000) {
+  const intentFile = path.join(STATE_DIR, 'relaunch-intent.json');
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const intent = readJsonSafe(intentFile, null);
+    if (!intent || typeof intent.startedAt !== 'number' || Date.now() - intent.startedAt > 15000) {
+      return;
+    }
+    sleepSync(200);
+  }
+}
+
 function spawnDetachedDaemon(nodePath) {
-  const child = spawn(nodePath, [CORE_DAEMON_SCRIPT, '--user-dir', USER_DIR], {
-    detached: true,
-    windowsHide: true,
-    stdio: 'ignore'
-  });
-  child.unref();
-  return child.pid;
+  let logFd = null;
+  let stdio = 'ignore';
+  try {
+    fs.mkdirSync(path.dirname(DAEMON_LOG_FILE), { recursive: true });
+    logFd = fs.openSync(DAEMON_LOG_FILE, 'a');
+    stdio = ['ignore', logFd, logFd];
+  } catch {}
+  try {
+    const child = spawn(nodePath, [CORE_DAEMON_SCRIPT, '--user-dir', USER_DIR], {
+      detached: true,
+      windowsHide: true,
+      stdio
+    });
+    child.unref();
+    return child.pid;
+  } finally {
+    if (logFd !== null) {
+      try {
+        fs.closeSync(logFd);
+      } catch {}
+    }
+  }
 }
 
 function ensureCoreDaemon() {
@@ -1320,17 +1451,54 @@ function ensureCoreDaemon() {
 </plist>
 `;
     writeFileAtomic(DAEMON_PLIST, plistXml);
+    waitForActiveRelaunchWindow(5000);
     const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
+    const serviceTarget = `gui/${uid}/${DAEMON_LABEL}`;
+    let hadLoaded = false;
     try {
-      execFileSync('launchctl', ['bootout', `gui/${uid}`, DAEMON_PLIST], { stdio: 'ignore' });
+      execFileSync('launchctl', ['print', serviceTarget], { stdio: 'ignore', timeout: 2000 });
+      hadLoaded = true;
     } catch {}
+    if (hadLoaded) {
+      try {
+        execFileSync('launchctl', ['bootout', `gui/${uid}`, DAEMON_PLIST], { stdio: 'ignore', timeout: 4000 });
+      } catch {}
+      /* Wait for launchd teardown to complete before calling bootstrap (prevents race -> Bootstrap failed: 5) */
+      const teardownDeadline = Date.now() + 1800;
+      while (Date.now() < teardownDeadline) {
+        try {
+          execFileSync('launchctl', ['print', serviceTarget], { stdio: 'ignore', timeout: 1000 });
+          sleepSync(120);
+        } catch {
+          break;
+        }
+      }
+    }
     try {
-      execFileSync('launchctl', ['enable', `gui/${uid}/${DAEMON_LABEL}`], { stdio: 'ignore' });
+      execFileSync('launchctl', ['enable', serviceTarget], { stdio: 'ignore', timeout: 2000 });
     } catch {}
-    try {
-      execFileSync('launchctl', ['bootstrap', `gui/${uid}`, DAEMON_PLIST], { stdio: 'pipe' });
-      execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${DAEMON_LABEL}`], { stdio: 'ignore' });
-    } catch (err) {
+    let bootErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        execFileSync('launchctl', ['bootstrap', `gui/${uid}`, DAEMON_PLIST], { stdio: 'pipe', timeout: 5000 });
+        bootErr = null;
+        break;
+      } catch (err) {
+        bootErr = err;
+        const msg = String(err?.stderr || err?.message || '');
+        if (/already loaded|already bootstrapped/i.test(msg)) {
+          try {
+            execFileSync('launchctl', ['kickstart', '-k', serviceTarget], { stdio: 'ignore', timeout: 4000 });
+            bootErr = null;
+            break;
+          } catch (kErr) {
+            bootErr = kErr;
+          }
+        }
+        if (attempt < 2) sleepSync(250 * (attempt + 1));
+      }
+    }
+    if (bootErr) {
       const pid = spawnDetachedDaemon(nodePath);
       if (pid) {
         return {
@@ -1340,34 +1508,18 @@ function ensureCoreDaemon() {
           node: nodePath,
           pid,
           fallbackDetached: true,
-          launchctlNote: String(err?.stderr || err?.message).trim()
+          launchctlNote: String(bootErr?.stderr || bootErr?.message).trim()
         };
       }
-      return { ok: false, reason: `launchctl_bootstrap_failed: ${String(err?.stderr || err?.message).trim()}`, plist: DAEMON_PLIST };
+      return { ok: false, reason: `launchctl_bootstrap_failed: ${String(bootErr?.stderr || bootErr?.message).trim()}`, plist: DAEMON_PLIST };
     }
+    /* plist sets RunAtLoad=true + KeepAlive=true, so successful bootstrap already starts the daemon once */
     return { ok: true, label: DAEMON_LABEL, plist: DAEMON_PLIST, node: nodePath };
   }
 
   if (process.platform === 'win32') {
     const vbsPath = getWinStartupVbsPath();
-    /* Encode non-ASCII characters via ChrW() so WScript never garbles Unicode usernames without BOM */
-    const vbsExpr = (s) => {
-      let out = '"';
-      for (const ch of String(s)) {
-        const cp = ch.codePointAt(0);
-        if (ch === '"') out += '""';
-        else if (cp >= 32 && cp <= 126) out += ch;
-        else if (cp <= 0xffff) out += `" & ChrW(${cp}) & "`;
-        else {
-          const hi = Math.floor((cp - 0x10000) / 0x400) + 0xd800;
-          const lo = ((cp - 0x10000) % 0x400) + 0xdc00;
-          out += `" & ChrW(${hi}) & ChrW(${lo}) & "`;
-        }
-      }
-      return out + '"';
-    };
-    const cmdExpr = `${vbsExpr(`"${nodePath}" "${CORE_DAEMON_SCRIPT}" --user-dir "${USER_DIR}"`)}`;
-    const vbs = `Set sh = CreateObject("WScript.Shell")\r\nsh.Run ${cmdExpr.replace(/""/g, '""""')}, 0, False\r\n`;
+    const vbs = buildWinStartupVbs(nodePath, CORE_DAEMON_SCRIPT, USER_DIR);
     try {
       writeFileAtomic(vbsPath, vbs);
     } catch {}
@@ -1381,11 +1533,44 @@ function ensureCoreDaemon() {
     writeFileAtomic(unitPath, unit);
     execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore', timeout: 4000 });
     execFileSync('systemctl', ['--user', 'enable', '--now', 'anti-claude-daemon.service'], { stdio: 'ignore', timeout: 5000 });
+    execFileSync('systemctl', ['--user', 'restart', 'anti-claude-daemon.service'], { stdio: 'ignore', timeout: 5000 });
     return { ok: true, systemdUnit: unitPath };
   } catch {
     const pid = spawnDetachedDaemon(nodePath);
     return { ok: true, mode: 'detached', pid };
   }
+}
+
+export function buildWinStartupVbs(nodePath, daemonScript, userDir) {
+  /* Encode non-ASCII characters via ChrW() so WScript never garbles Unicode usernames without BOM */
+  const vbsExpr = (s) => {
+    const parts = [];
+    let buf = '';
+    const flush = () => {
+      if (buf) {
+        parts.push(`"${buf}"`);
+        buf = '';
+      }
+    };
+    for (const ch of String(s)) {
+      const cp = ch.codePointAt(0);
+      if (ch === '"') buf += '""';
+      else if (cp >= 32 && cp <= 126) buf += ch;
+      else if (cp <= 0xffff) {
+        flush();
+        parts.push(`ChrW(${cp})`);
+      } else {
+        flush();
+        const hi = Math.floor((cp - 0x10000) / 0x400) + 0xd800;
+        const lo = ((cp - 0x10000) % 0x400) + 0xdc00;
+        parts.push(`ChrW(${hi})`, `ChrW(${lo})`);
+      }
+    }
+    flush();
+    return parts.length ? parts.join(' & ') : '""';
+  };
+  const cmdExpr = vbsExpr(`"${nodePath}" "${daemonScript}" --user-dir "${userDir}"`);
+  return `Set sh = CreateObject("WScript.Shell")\r\nsh.Run ${cmdExpr}, 0, False\r\n`;
 }
 
 function disableCoreDaemon() {
@@ -1606,41 +1791,53 @@ function installCliLayer(state, { sourceRoot = __dirname, overwriteLocal = false
   let conflict = false;
 
   if (!state.cli.statusLineScript) {
-    if (localText !== null) {
-      fs.mkdirSync(BACKUP_DIR, { recursive: true });
-      fs.writeFileSync(path.join(BACKUP_DIR, AGY_CLI_STATUSLINE_NAME), localText, 'utf8');
-    }
-    state.cli.statusLineScript = { existedBefore: localText !== null, deployedSha: '' };
-    deployCliStatusLineScript(srcText, state);
-    scriptAction = 'created';
-  } else if (localText === null) {
-    deployCliStatusLineScript(srcText, state);
-    scriptAction = 'updated';
-  } else if (localText === srcText) {
-    if (readTextSafe(path.join(BASE_DIR, AGY_CLI_STATUSLINE_NAME)) !== srcText) {
-      deployCliStatusLineScript(srcText, state);
-    }
-    scriptAction = 'unchanged';
-  } else {
+    const bakPath = path.join(BACKUP_DIR, AGY_CLI_STATUSLINE_NAME);
     const baseText = readTextSafe(path.join(BASE_DIR, AGY_CLI_STATUSLINE_NAME));
-    const localUntouched =
-      baseText !== null ? localText === baseText : sha256Text(localText) === state.cli.statusLineScript.deployedSha;
-    if (localUntouched) {
+    if (fs.existsSync(bakPath) || baseText !== null) {
+      state.cli.statusLineScript = {
+        existedBefore: fs.existsSync(bakPath),
+        deployedSha: baseText !== null ? sha256Text(baseText) : ''
+      };
+    } else {
+      if (localText !== null) {
+        fs.mkdirSync(BACKUP_DIR, { recursive: true });
+        fs.writeFileSync(bakPath, localText, 'utf8');
+      }
+      state.cli.statusLineScript = { existedBefore: localText !== null, deployedSha: '' };
+      deployCliStatusLineScript(srcText, state);
+      scriptAction = 'created';
+    }
+  }
+  if (scriptAction !== 'created') {
+    if (localText === null) {
       deployCliStatusLineScript(srcText, state);
       scriptAction = 'updated';
-    } else if (overwriteLocal) {
-      writeFileAtomic(
-        path.join(LOCAL_SAVE_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}-${AGY_CLI_STATUSLINE_NAME}`),
-        localText
-      );
-      deployCliStatusLineScript(srcText, state);
-      scriptAction = 'overwritten';
-    } else if (baseText === srcText) {
-      scriptAction = 'unchanged (local edits kept)';
+    } else if (localText === srcText) {
+      if (readTextSafe(path.join(BASE_DIR, AGY_CLI_STATUSLINE_NAME)) !== srcText) {
+        deployCliStatusLineScript(srcText, state);
+      }
+      scriptAction = 'unchanged';
     } else {
-      writeFileAtomic(path.join(INCOMING_DIR, AGY_CLI_STATUSLINE_NAME), srcText);
-      scriptAction = 'conflict';
-      conflict = true;
+      const baseText = readTextSafe(path.join(BASE_DIR, AGY_CLI_STATUSLINE_NAME));
+      const localUntouched =
+        baseText !== null ? localText === baseText : sha256Text(localText) === state.cli.statusLineScript.deployedSha;
+      if (localUntouched) {
+        deployCliStatusLineScript(srcText, state);
+        scriptAction = 'updated';
+      } else if (overwriteLocal) {
+        writeFileAtomic(
+          path.join(LOCAL_SAVE_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}-${AGY_CLI_STATUSLINE_NAME}`),
+          localText
+        );
+        deployCliStatusLineScript(srcText, state);
+        scriptAction = 'overwritten';
+      } else if (baseText === srcText) {
+        scriptAction = 'unchanged (local edits kept)';
+      } else {
+        writeFileAtomic(path.join(INCOMING_DIR, AGY_CLI_STATUSLINE_NAME), srcText);
+        scriptAction = 'conflict';
+        conflict = true;
+      }
     }
   }
 
@@ -1657,26 +1854,40 @@ function installCliLayer(state, { sourceRoot = __dirname, overwriteLocal = false
 
   const currentStatusLine = cfg.statusLine;
   const isOurs = String(currentStatusLine?.command || '').includes(AGY_CLI_STATUSLINE_NAME);
+  const hasCustomOverride = Boolean(currentStatusLine && !isOurs);
   let settingsAction = 'unchanged';
 
   if (allowSettingsEnable) {
-    if (!state.cli.settings) {
-      state.cli.settings = {
-        existedBefore: settingsExisted,
-        changed: true,
-        hadStatusLine: Object.prototype.hasOwnProperty.call(cfg, 'statusLine'),
-        beforeStatusLine: clone(cfg.statusLine),
-        deployedCommand: cmd
-      };
+    if (state.cli.settings && hasCustomOverride && !overwriteLocal) {
+      /* Preserve user-configured custom statusLine on re-install unless --overwrite-local is passed */
+      settingsAction = 'user_override_respected';
     } else {
-      state.cli.settings.changed = true;
-      state.cli.settings.deployedCommand = cmd;
-    }
-    const desired = { type: 'command', command: cmd, enabled: true };
-    if (!deepEqual(cfg.statusLine, desired)) {
-      cfg.statusLine = desired;
-      writeJsonAtomic(AGY_CLI_SETTINGS_JSON, cfg);
-      settingsAction = settingsExisted ? 'updated' : 'created';
+      if (!state.cli.settings) {
+        state.cli.settings = {
+          existedBefore: settingsExisted,
+          changed: true,
+          hadStatusLine: Object.prototype.hasOwnProperty.call(cfg, 'statusLine'),
+          beforeStatusLine: clone(cfg.statusLine),
+          deployedCommand: cmd
+        };
+      } else {
+        if (hasCustomOverride) {
+          try {
+            writeFileAtomic(
+              path.join(LOCAL_SAVE_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}-cli-statusline.json`),
+              `${JSON.stringify({ statusLine: currentStatusLine }, null, 2)}\n`
+            );
+          } catch {}
+        }
+        state.cli.settings.changed = true;
+        state.cli.settings.deployedCommand = cmd;
+      }
+      const desired = { type: 'command', command: cmd, enabled: true };
+      if (!deepEqual(cfg.statusLine, desired)) {
+        cfg.statusLine = desired;
+        writeJsonAtomic(AGY_CLI_SETTINGS_JSON, cfg);
+        settingsAction = settingsExisted ? 'updated' : 'created';
+      }
     }
   } else if (isOurs && currentStatusLine?.enabled === true && currentStatusLine.command !== cmd) {
     cfg.statusLine = Object.assign({}, currentStatusLine, { command: cmd });
@@ -1896,6 +2107,9 @@ async function cmdInstall(flags) {
 
   const coreDaemon = ensureCoreDaemon();
   if (!coreDaemon.ok) warnings.push(`core daemon: ${coreDaemon.reason}`);
+  else if (coreDaemon.fallbackDetached) {
+    warnings.push(`core daemon fell back to detached process (no launchd KeepAlive): ${coreDaemon.launchctlNote || 'launchctl failed'}`);
+  }
 
   let stepUnlock = { skipped: 'disabled_by_option' };
   if (state.options.stepUnlock) {
@@ -1971,8 +2185,18 @@ async function cmdSyncUpgrade(flags) {
     if (selfPull.updated) {
       const v = validateSourceRoot();
       if (!v.ok) {
+        const rolledBack = rollbackSelfRepo(selfPull.beforeFullHead);
         saveState(state);
-        return finalize({ selfPull, validation: v }, { critical: ['pulled code failed validation; live files left untouched'] });
+        return finalize(
+          { selfPull, rolledBack, validation: v },
+          {
+            critical: [
+              rolledBack
+                ? 'pulled code failed validation; repository rolled back to previous healthy commit'
+                : 'pulled code failed validation; automatic git rollback failed, inspect repository'
+            ]
+          }
+        );
       }
       state.sync.lastRemoteCheckOk = true;
       saveState(state);
@@ -2018,6 +2242,9 @@ async function cmdSyncUpgrade(flags) {
 
   const coreDaemon = ensureCoreDaemon();
   if (!coreDaemon.ok) warnings.push(`core daemon: ${coreDaemon.reason}`);
+  else if (coreDaemon.fallbackDetached) {
+    warnings.push(`core daemon fell back to detached process (no launchd KeepAlive): ${coreDaemon.launchctlNote || 'launchctl failed'}`);
+  }
 
   let stepUnlock = { skipped: appChanged ? 'disabled_by_option' : 'app_unchanged' };
   if (appChanged && state.options.stepUnlock) stepUnlock = await applyStepUnlock(state);

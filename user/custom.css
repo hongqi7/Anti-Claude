@@ -3376,6 +3376,40 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cux-settings-group {
   padding: 13px 16px !important;
 }
 
+/* Match Antigravity native Settings Switch dimensions & colors (h-6 w-11 = 44x24px, thumb h-4 w-4 = 16x16px, 4px/24px) */
+#ag-claude-ux-settings-panel .ag-claude-switch {
+  width: 44px !important;
+  height: 24px !important;
+  transition: background-color 200ms ease-in-out !important;
+}
+
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) #ag-claude-ux-settings-panel .ag-claude-switch[aria-checked="false"] {
+  background-color: #E2E2DF !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) #ag-claude-ux-settings-panel .ag-claude-switch[aria-checked="false"] {
+  background-color: #3A3A38 !important;
+}
+
+#ag-claude-ux-settings-panel .ag-claude-switch[aria-checked="true"] {
+  background-color: var(--primary, #2F75C3) !important;
+}
+
+#ag-claude-ux-settings-panel .ag-claude-switch > span {
+  width: 16px !important;
+  height: 16px !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14) !important;
+  transition: transform 200ms ease-in-out !important;
+}
+
+#ag-claude-ux-settings-panel .ag-claude-switch[aria-checked="false"] > span {
+  transform: translateX(4px) !important;
+}
+
+#ag-claude-ux-settings-panel .ag-claude-switch[aria-checked="true"] > span {
+  transform: translateX(24px) !important;
+}
+
 html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cux-settings-row + .ag-cux-settings-row {
   border-top: 1px solid var(--border, rgba(0, 0, 0, 0.075)) !important;
 }
@@ -6362,9 +6396,9 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) [data-testid="settings-sid
   font-weight: 400 !important;
 }
 
-/* Zero-frame FOUC shield: keep unclassified h2 scope headers & lists hidden from Frame 0 until JS classifies them */
-[data-testid="settings-sidebar"] div.px-4.mt-2:not([data-ag-stats-subhdr="1"]):not([data-ag-stats-passthrough="1"]),
-[data-testid="settings-sidebar"] div.px-4.mt-2:not([data-ag-stats-passthrough="1"]) + div.flex.flex-col.gap-0\.5:not([data-ag-stats-list="1"]),
+/* Only hide classified or JS-managed Stats headers/lists once JS confirms the native structure matches */
+[data-testid="settings-sidebar"][data-ag-stats-ready="1"] div.px-4.mt-2:not([data-ag-stats-subhdr="1"]):not([data-ag-stats-passthrough="1"]),
+[data-testid="settings-sidebar"][data-ag-stats-ready="1"] div.px-4.mt-2:not([data-ag-stats-passthrough="1"]) + div.flex.flex-col.gap-0\.5:not([data-ag-stats-list="1"]),
 [data-testid="settings-sidebar"] [data-ag-stats-hidden="1"],
 [data-testid="settings-sidebar"] > div.overflow-y-auto > div.px-4.mt-2[data-ag-stats-subhdr="1"][data-ag-stats-hidden="1"],
 [data-testid="settings-sidebar"] div.flex.flex-col.gap-0\.5[data-ag-stats-list="1"][data-ag-stats-hidden="1"] {

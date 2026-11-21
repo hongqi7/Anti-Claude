@@ -149,7 +149,8 @@
   const SVG_DONE =
     '<svg class="ag-todo-ico ag-todo-done" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="7.1" fill="currentColor"/><path class="ag-todo-done-check" d="M5.05 8.15l1.95 1.95 3.95-4.1" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-  const PAST_LABEL_RE = /^(?:Explored|Ran\b|Edited\b|Done\b|已探索|已运行|已编辑|已完成)/i;
+  const PAST_LABEL_RE =
+    /^(?:Explored|Ran\b|Edited\b|Done\b|Read\b|Searched|Listed|Viewed|Checked|Found\b|Created|Updated|Deleted|Wrote\b|Written|Built\b|Tested|Installed|Fetched|Analyzed|Reviewed|Thought\b|Worked\b|Completed|Finished|Failed|Stopped|Cancelled|Canceled|Skipped|已探索|已运行|已编辑|已完成|已读取|已搜索|已查看|已检查|已创建|已更新|已删除|已写入|已构建|已测试|已失败|已取消|完成了|思考了)/i;
 
   const onDocClick = (e) => {
     if (!e.isTrusted) return;
@@ -934,7 +935,8 @@
             if (sameTurn) {
               join = evolved;
             } else {
-              const looksLikeProgress = active || isAllTodoCompleted(entry.items);
+              const explicitContinuation = Boolean(entry.turnEl && turnContinuesChecklist(entry.turnEl, last.items));
+              const looksLikeProgress = active || (isAllTodoCompleted(entry.items) && explicitContinuation);
               join = evolved || (!isAllTodoCompleted(last.items) && looksLikeProgress);
             }
           }
@@ -1059,6 +1061,10 @@
     for (const ul of document.querySelectorAll('ul[data-ag-todo-merged], ul[data-ag-todo-primary]')) {
       if (!touched.has(ul)) restoreNativeUl(ul);
     }
+    if (!FEAT.todoCard) {
+      document.querySelectorAll('[data-ag-todo-empty-wrap]').forEach((el) => el.removeAttribute('data-ag-todo-empty-wrap'));
+      document.querySelectorAll('[data-ag-todo-marker-line]').forEach((el) => el.removeAttribute('data-ag-todo-marker-line'));
+    }
     for (const card of document.querySelectorAll('[data-ag-todo-mount]')) {
       if (card.parentElement && card.parentElement.hasAttribute('data-ag-todo-dock')) continue;
       const prev = card.previousElementSibling;
@@ -1178,10 +1184,10 @@
    * 2. Attaches U+2060 WORD JOINER between atomic inline pills (`inline-flex` file mentions) and adjacent CJK
    *    closing/middle punctuation (`、，。！？；：）》」』】`) or opening brackets (`（《「『【`) so punctuation never wraps to line start.
    * Mutates `Text.nodeValue` only (zero childList mutations, zero React Fiber interference) and restores on `dispose()`. */
-  const pillSiblingOrig = new WeakMap();
+  const pillSiblingEdits = new WeakMap();
   const WORD_JOINER = '\u2060';
-  const CJK_OR_FULL_PUNCT_END_SPACE_RE = /([\u4e00-\u9fff\u3000-\u303f\uff01-\uff60“‘])[ \t]+$/;
-  const CJK_OR_FULL_PUNCT_LEAD_SPACE_RE = /^[ \t]+([\u4e00-\u9fff\u3000-\u303f\uff01-\uff60”’])/;
+  const CJK_OR_FULL_PUNCT_END_SPACE_RE = /([\u4e00-\u9fff\u3000-\u303f\uff01-\uff60“‘])([ \t]+)$/;
+  const CJK_OR_FULL_PUNCT_LEAD_SPACE_RE = /^([ \t]+)([\u4e00-\u9fff\u3000-\u303f\uff01-\uff60”’])/;
   const CJK_OPEN_PUNCT_END_RE = /[（《「『【〈“‘]$/;
   const CJK_CLOSE_OR_MID_PUNCT_START_RE = /^[、，。！？；：）》」』】〉”’—…]/;
 
@@ -1201,12 +1207,18 @@
       const prev = pill.previousSibling;
       if (prev && prev.nodeType === 3) {
         const cur = prev.nodeValue || '';
-        let next = cur.replace(CJK_OR_FULL_PUNCT_END_SPACE_RE, '$1');
+        const spaceMatch = cur.match(CJK_OR_FULL_PUNCT_END_SPACE_RE);
+        let next = spaceMatch ? cur.slice(0, cur.length - spaceMatch[2].length) : cur;
+        let addedTrailWj = false;
         if (CJK_OPEN_PUNCT_END_RE.test(next) && !next.endsWith(WORD_JOINER)) {
           next += WORD_JOINER;
+          addedTrailWj = true;
         }
         if (next !== cur) {
-          if (!pillSiblingOrig.has(prev)) pillSiblingOrig.set(prev, cur);
+          const rec = pillSiblingEdits.get(prev) || {};
+          if (spaceMatch && !rec.strippedTrailSpace) rec.strippedTrailSpace = spaceMatch[2];
+          if (addedTrailWj) rec.addedTrailWj = true;
+          pillSiblingEdits.set(prev, rec);
           prev.nodeValue = next;
         }
       }
@@ -1214,13 +1226,20 @@
       const fol = pill.nextSibling;
       if (fol && fol.nodeType === 3) {
         const cur = fol.nodeValue || '';
-        const withoutWj = cur.startsWith(WORD_JOINER) ? cur.slice(1) : cur;
-        let next = withoutWj.replace(CJK_OR_FULL_PUNCT_LEAD_SPACE_RE, '$1');
+        const hadWj = cur.startsWith(WORD_JOINER);
+        const withoutWj = hadWj ? cur.slice(1) : cur;
+        const spaceMatch = withoutWj.match(CJK_OR_FULL_PUNCT_LEAD_SPACE_RE);
+        let next = spaceMatch ? withoutWj.slice(spaceMatch[1].length) : withoutWj;
+        let addedLeadWj = false;
         if (CJK_CLOSE_OR_MID_PUNCT_START_RE.test(next)) {
           next = WORD_JOINER + next;
+          addedLeadWj = true;
         }
         if (next !== cur) {
-          if (!pillSiblingOrig.has(fol)) pillSiblingOrig.set(fol, cur);
+          const rec = pillSiblingEdits.get(fol) || {};
+          if (spaceMatch && !rec.strippedLeadSpace) rec.strippedLeadSpace = spaceMatch[1];
+          if (addedLeadWj) rec.addedLeadWj = true;
+          pillSiblingEdits.set(fol, rec);
           fol.nodeValue = next;
         }
       }
@@ -1231,10 +1250,15 @@
     const pills = document.querySelectorAll(':not(pre) > code, bdi.context-scope-mention');
     for (const pill of pills) {
       for (const node of [pill.previousSibling, pill.nextSibling]) {
-        if (node && node.nodeType === 3 && pillSiblingOrig.has(node)) {
-          node.nodeValue = pillSiblingOrig.get(node);
-          pillSiblingOrig.delete(node);
-        }
+        if (!node || node.nodeType !== 3 || !pillSiblingEdits.has(node)) continue;
+        const rec = pillSiblingEdits.get(node);
+        let val = node.nodeValue || '';
+        if (rec.addedLeadWj && val.startsWith(WORD_JOINER)) val = val.slice(1);
+        if (rec.strippedLeadSpace && !val.startsWith(rec.strippedLeadSpace)) val = rec.strippedLeadSpace + val;
+        if (rec.addedTrailWj && val.endsWith(WORD_JOINER)) val = val.slice(0, -1);
+        if (rec.strippedTrailSpace && !val.endsWith(rec.strippedTrailSpace)) val = val + rec.strippedTrailSpace;
+        node.nodeValue = val;
+        pillSiblingEdits.delete(node);
       }
     }
   }
@@ -1248,6 +1272,7 @@
   const CODE_FOLD_MIN_LINES = 40;
   const CODE_FOLD_KEYS_MAX = 300;
   const codeFoldUserState = new Map();
+  const codeBlockMetricCache = new WeakMap();
   const SVG_CODE_FOLD_CHEVRON =
     '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
     '<path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>' +
@@ -1270,19 +1295,52 @@
     return blocks;
   }
 
-  function codeBlockLineCount(codeEl) {
-    if (!codeEl) return 0;
+  function hashTextFnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+  }
+
+  function getCodeBlockMetrics(header, codeEl) {
+    if (!codeEl) return { lines: 0, key: '' };
+    const langEl = header && header.firstElementChild;
+    const lang = langEl && langEl.textContent ? langEl.textContent.trim() : '';
+    const childCount = codeEl.childNodes ? codeEl.childNodes.length : 0;
+    const firstNode = codeEl.firstChild;
+    const lastNode = codeEl.lastChild;
+    const cached = codeBlockMetricCache.get(codeEl);
+    if (
+      cached &&
+      cached.lang === lang &&
+      cached.childCount === childCount &&
+      cached.firstNode === firstNode &&
+      cached.lastNode === lastNode &&
+      (childCount > 1 || (firstNode && firstNode.nodeValue === cached.singleText))
+    ) {
+      return cached;
+    }
     const lineNodes = codeEl.querySelectorAll('.code-line');
-    if (lineNodes.length > 0) return lineNodes.length;
     const txt = codeEl.textContent || '';
-    return txt ? txt.split('\n').length : 0;
+    const lines = lineNodes.length > 0 ? lineNodes.length : txt ? txt.split('\n').length : 0;
+    const key = `${lang}|${txt.length}|${hashTextFnv1a(txt)}`;
+    const next = {
+      lang,
+      childCount,
+      firstNode,
+      lastNode,
+      singleText: childCount <= 1 && firstNode ? firstNode.nodeValue : undefined,
+      lines,
+      key
+    };
+    codeBlockMetricCache.set(codeEl, next);
+    return next;
   }
 
   function codeBlockKey(header, codeEl) {
-    const langEl = header && header.firstElementChild;
-    const lang = langEl && langEl.textContent ? langEl.textContent.trim() : '';
-    const snippet = codeEl && codeEl.textContent ? codeEl.textContent.slice(0, 160) : '';
-    return `${lang}|${snippet}`;
+    return getCodeBlockMetrics(header, codeEl).key;
   }
 
   function rememberCodeFoldState(key, stateVal) {
@@ -1317,12 +1375,11 @@
     if (wrap.getAttribute('data-ag-code-wrap') !== 'true') {
       wrap.setAttribute('data-ag-code-wrap', 'true');
     }
-    const lines = codeBlockLineCount(codeEl);
+    const { lines, key } = getCodeBlockMetrics(header, codeEl);
     if (lines >= CODE_FOLD_MIN_LINES) {
       if (wrap.getAttribute('data-ag-code-long') !== 'true') {
         wrap.setAttribute('data-ag-code-long', 'true');
       }
-      const key = codeBlockKey(header, codeEl);
       const collapsed = codeFoldUserState.get(key) !== 'expanded';
       const nextAttr = collapsed ? 'true' : 'false';
       if (wrap.getAttribute('data-ag-code-collapsed') !== nextAttr) {
@@ -1439,6 +1496,8 @@
           }
         }
       }
+    } else {
+      document.querySelectorAll('[data-ag-inline-stream]').forEach((el) => el.removeAttribute('data-ag-inline-stream'));
     }
     if (FEAT.collapseAnim) captureOpenToolPanels();
     const panes = collectPanes();
@@ -1553,8 +1612,38 @@
     return (sel && sel.getAttribute('data-cascade-id')) || '';
   }
 
-  function discoverAgentInputProps() {
-    const inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
+  function getActiveInputBox(anchorEl) {
+    if (anchorEl && anchorEl.closest) {
+      const own = anchorEl.closest('[id="antigravity.agentSidePanelInputBox"]');
+      if (own) return own;
+      const view = anchorEl.closest('[data-testid="conversation-view"]');
+      if (view) {
+        const inView = view.querySelector('[id="antigravity.agentSidePanelInputBox"]');
+        if (inView) return inView;
+      }
+    }
+    const boxes = document.querySelectorAll('[id="antigravity.agentSidePanelInputBox"]');
+    if (boxes.length <= 1) return boxes[0] || null;
+    const ae = document.activeElement;
+    if (ae && ae.closest) {
+      const aeView = ae.closest('[data-testid="conversation-view"]');
+      if (aeView) {
+        const aeBox = aeView.querySelector('[id="antigravity.agentSidePanelInputBox"]');
+        if (aeBox) return aeBox;
+      }
+    }
+    const cid = getActiveCascadeId();
+    if (cid) {
+      for (const b of boxes) {
+        const v = b.closest && b.closest('[data-testid="conversation-view"]');
+        if (v && v.getAttribute('data-cascade-id') === cid) return b;
+      }
+    }
+    return boxes[0] || null;
+  }
+
+  function discoverAgentInputProps(anchorEl) {
+    const inputBox = getActiveInputBox(anchorEl);
     if (!inputBox) return null;
     const fk = Object.keys(inputBox).find((k) => k.startsWith('__reactFiber$'));
     let f = fk ? inputBox[fk] : null;
@@ -1565,8 +1654,8 @@
     return null;
   }
 
-  function discoverComposerContextFromInputBox() {
-    const inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
+  function discoverComposerContextFromInputBox(anchorEl) {
+    const inputBox = getActiveInputBox(anchorEl);
     if (!inputBox) return null;
     const fk = Object.keys(inputBox).find((k) => k.startsWith('__reactFiber$'));
     let f = fk ? inputBox[fk] : null;
@@ -1874,19 +1963,18 @@
 
     try {
       if (agentProps && typeof agentProps.handleSubmit === 'function') {
-        const slashItems = Array.isArray(agentProps.slashCommandItems) ? agentProps.slashCommandItems : [];
+        const hasSlashList = Array.isArray(agentProps.slashCommandItems);
+        const slashItems = hasSlashList ? agentProps.slashCommandItems : [];
         const compactDef = slashItems.find(
           (x) => x && (x.title === 'compact' || (x.info && x.info.name === 'compact'))
         );
-        const slashInfo = (compactDef && compactDef.info) || {
-          $typeName: 'exa.codeium_common_pb.SlashCommandInfo',
-          name: 'compact',
-          modelFacingText: '',
-          type: 1,
-          icon: 'collapse_all',
-          displayName: '',
-          logo: ''
-        };
+        if (!compactDef || !compactDef.info) {
+          /* Never fabricate a hard-coded SlashCommandInfo proto if official /compact definition is absent */
+          manualCompactPending = { cascadeId: '', startedAt: 0 };
+          syncCompactVisualState(true);
+          return false;
+        }
+        const slashInfo = compactDef.info;
         const submitItems = [
           {
             $typeName: 'exa.codeium_common_pb.TextOrScopeItem',
@@ -2353,9 +2441,13 @@
   }
   ensureMetricsWrapped();
 
+  let lastQuotaSvcMissTs = 0;
   function discoverQuotaService(refreshAccount = false) {
     if (!refreshAccount && cachedQuotaSvc && cachedUserTierName && cachedUserAccountKey) return cachedQuotaSvc;
-    const inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
+    if (!refreshAccount && !cachedQuotaSvc && lastQuotaSvcMissTs && Date.now() - lastQuotaSvcMissTs < 5000) {
+      return null;
+    }
+    const inputBox = getActiveInputBox();
     if (!inputBox) return cachedQuotaSvc;
     const fk = Object.keys(inputBox).find((k) => k.startsWith('__reactFiber$'));
     let f = fk ? inputBox[fk] : null;
@@ -2410,7 +2502,12 @@
       if (foundSvc && foundTierName) break;
     }
 
-    if (foundSvc) cachedQuotaSvc = foundSvc;
+    if (foundSvc) {
+      cachedQuotaSvc = foundSvc;
+      lastQuotaSvcMissTs = 0;
+    } else {
+      lastQuotaSvcMissTs = Date.now();
+    }
     if (foundTierName) {
       const nextAccountKey = `${foundEmail}|${foundTierId}|${foundTierName}`;
       if (cachedUserAccountKey && cachedUserAccountKey !== nextAccountKey) {
@@ -2850,7 +2947,7 @@
   }
 
   function ensureComposerContextRing() {
-    const inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
+    const inputBox = getActiveInputBox();
     if (!inputBox) return;
 
     /* On the Home `/` screen, the composer has a top project/location row that ALSO matches
@@ -3163,6 +3260,7 @@
       const orchMap = (st && st.modelSelection && st.modelSelection.orchestratorByConversation) || {};
       const draftOrchModel = orchMap[''] !== undefined ? orchMap[''] : 0;
       return {
+        isReduxFallback: true,
         modelOptions,
         customModels,
         selectedModel,
@@ -3260,6 +3358,12 @@
       return null;
     }
 
+    if (btnEl && btnEl.matches && btnEl.matches('button[data-testid="model-selector-trigger"]')) {
+      /* Stay scoped to this trigger's split pane; never steal another pane's native trigger API */
+      const ownApi = readNativeApi(btnEl);
+      if (ownApi) return ownApi;
+      return buildReduxModelSelectorApi();
+    }
     const candidates = [];
     if (btnEl) candidates.push(btnEl);
     if (nativeBtn && !candidates.includes(nativeBtn)) candidates.push(nativeBtn);
@@ -3272,6 +3376,59 @@
       if (api) return api;
     }
     return buildReduxModelSelectorApi();
+  }
+
+  /* ---- Native pass-through: this menu replaces Antigravity's own model menu, so anything the native menu
+     gains in a new release would be hidden behind it. Two guards keep official features reachable:
+       hard gap -> the native menu is in a mode this menu cannot drive correctly: step aside entirely;
+       soft gap -> the native menu offers extra options: keep this menu, flag the "Native menu" row.
+     Option/Alt + click on the trigger always opens the native menu. ---- */
+  const KNOWN_MODEL_API_KEYS = new Set([
+    'placement', 'selectedModel', 'setSelectedModel', 'modelSorts', 'modelOptions', 'userStatus', 'refreshModels',
+    'open', 'setIsOpen', 'customModels', 'supportsCustomModels', 'showCustomModelHeader', 'onAddCustomModel',
+    'onEditCustomModel', 'bestOfNConfig', 'contextWindow', 'isModelListLoading', 'finalFocus', 'footerExtra',
+    'orchestratorPick', 'children', 'groups', 'effortIndex', 'orchestratorPlanners', 'orchestratorPlannerIndex',
+    'orchestratorDefaultPlanner'
+  ]);
+  let bypassNativeModelTriggerUntil = 0;
+
+  function isCustomCssDisabled() {
+    return Boolean(typeof ctx !== 'undefined' && ctx && ctx.config && ctx.config.modules && ctx.config.modules.customCss === false);
+  }
+
+  function isNativeModelTriggerBtn(btn) {
+    return Boolean(btn && btn.matches && btn.matches('button[data-testid="model-selector-trigger"]'));
+  }
+
+  function canOpenNativeModelMenu(api, btn) {
+    return isNativeModelTriggerBtn(btn);
+  }
+
+  function nativeModelMenuGaps(api) {
+    const gaps = { hard: [], soft: [] };
+    if (!api || api.isReduxFallback) return gaps;
+    if (api.bestOfNConfig && api.bestOfNConfig.isBestOfNEnabled === true) gaps.hard.push('bestOfN');
+    if (api.footerExtra) gaps.soft.push('footerExtra');
+    if (api.supportsCustomModels === true) gaps.soft.push('customModels');
+    if (
+      api.contextWindow &&
+      (api.modelOptions || []).some((o) => o && Array.isArray(o.contextWindowOptions) && o.contextWindowOptions.length > 0)
+    ) {
+      gaps.soft.push('contextWindow');
+    }
+    for (const k of Object.keys(api)) {
+      if (!KNOWN_MODEL_API_KEYS.has(k)) gaps.soft.push(`new:${k}`);
+    }
+    return gaps;
+  }
+
+  function shouldDeferToNativeModelMenu(e, trigger, api) {
+    if (!isNativeModelTriggerBtn(trigger)) return false;
+    if (Date.now() < bypassNativeModelTriggerUntil) return true;
+    if (isCustomCssDisabled()) return true;
+    if (e && e.altKey) return true;
+    if (!api) return true;
+    return nativeModelMenuGaps(api).hard.length > 0;
   }
 
   function formatProjectComposerModelParts(api) {
@@ -3308,28 +3465,36 @@
 
   function applyModelSelectionOption(api, targetOpt, orchestratorPlannerOpt) {
     if (!targetOpt) return;
+    const isReduxFallback = Boolean(!api || api.isReduxFallback);
     if (orchestratorPlannerOpt && orchestratorPlannerOpt.value !== undefined) {
+      let calledNativeOrch = false;
       if (api && api.orchestratorPick && typeof api.orchestratorPick.select === 'function') {
         try {
           api.orchestratorPick.select(orchestratorPlannerOpt.value);
+          calledNativeOrch = true;
         } catch {}
       }
-      try {
-        const { store } = resolveProjectsStoreAndBindings();
-        if (store && typeof store.dispatch === 'function') {
-          store.dispatch({
-            type: 'modelSelection/orchestratorModelPicked',
-            payload: { model: orchestratorPlannerOpt.value }
-          });
-        }
-      } catch {}
+      if (!calledNativeOrch || isReduxFallback) {
+        try {
+          const { store } = resolveProjectsStoreAndBindings();
+          if (store && typeof store.dispatch === 'function') {
+            store.dispatch({
+              type: 'modelSelection/orchestratorModelPicked',
+              payload: { model: orchestratorPlannerOpt.value }
+            });
+          }
+        } catch {}
+      }
     }
+    let calledNativeSelect = false;
     if (api && typeof api.setSelectedModel === 'function') {
       try {
         api.setSelectedModel(targetOpt);
+        calledNativeSelect = true;
       } catch {}
     }
-    if (targetOpt.value !== undefined) {
+    /* Only mirror into global Redux modelSelection when no native session setter handled it (or on Redux fallback) */
+    if ((!calledNativeSelect || isReduxFallback) && targetOpt.value !== undefined) {
       try {
         const { store } = resolveProjectsStoreAndBindings();
         if (store && typeof store.dispatch === 'function') {
@@ -3413,10 +3578,15 @@
     const isOrch = (f) => Boolean(f && (f.isOrchestratorFamily || /orchestrator/i.test(f.baseName)));
     const isCoreGemini = (f) => /^gemini\b/i.test(f.baseName) && !isOrch(f);
 
-    const primaryFamilies = families
+    let primaryFamilies = families
       .filter(isCoreGemini)
       .sort((a, b) => modelCoreRank(a.baseName) - modelCoreRank(b.baseName))
       .slice(0, 5);
+    if (!primaryFamilies.length) {
+      /* Accounts that only expose non-Gemini models (e.g. "Claude Opus 5.5 · Devin") would otherwise get an
+         empty "Models · This chat" list with everything buried under More models: keep the native order. */
+      primaryFamilies = families.filter((f) => !isOrch(f)).slice(0, 5);
+    }
 
     const primarySet = new Set(primaryFamilies);
     const nonPrimaryEntries = families
@@ -3527,7 +3697,7 @@
         const famBtn = e.target.closest('[data-ag-cm-family]');
         if (famBtn) {
           const baseName = famBtn.getAttribute('data-ag-cm-family');
-          const api = discoverModelSelectorApi();
+          const api = discoverModelSelectorApi(activeModelTriggerBtn);
           if (api) {
             const cat = buildModelCatalog(api);
             const fam = cat.primaryFamilies.find((f) => f.baseName === baseName);
@@ -3543,6 +3713,27 @@
           const kind = subTrigger.getAttribute('data-ag-cm-subtrigger');
           activeModelSubmenu = activeModelSubmenu === kind ? null : kind;
           renderModelPopovers();
+          return;
+        }
+        if (e.target.closest('[data-ag-cm-native]')) {
+          const btn = activeModelTriggerBtn || findModelTriggerBtn();
+          const api = discoverModelSelectorApi(btn);
+          closeClaudeModelPopover();
+          if (isNativeModelTriggerBtn(btn)) {
+            later(() => {
+              if (api && !api.isReduxFallback && typeof api.setIsOpen === 'function') {
+                try {
+                  api.setIsOpen(true);
+                  return;
+                } catch {}
+              }
+              /* Fallback pass-through when native Fiber API is unavailable */
+              bypassNativeModelTriggerUntil = Date.now() + 350;
+              try {
+                btn.click();
+              } catch {}
+            }, 0);
+          }
         }
       });
       document.body.appendChild(mainPop);
@@ -3559,7 +3750,7 @@
         const effBtn = e.target.closest('[data-ag-cm-effort]');
         if (effBtn) {
           const eff = effBtn.getAttribute('data-ag-cm-effort');
-          const api = discoverModelSelectorApi();
+          const api = discoverModelSelectorApi(activeModelTriggerBtn);
           if (api) {
             const cat = buildModelCatalog(api);
             if (cat.activeFamily) {
@@ -3576,7 +3767,7 @@
         const moreBtn = e.target.closest('[data-ag-cm-more-family]');
         if (moreBtn) {
           const baseName = moreBtn.getAttribute('data-ag-cm-more-family');
-          const api = discoverModelSelectorApi();
+          const api = discoverModelSelectorApi(activeModelTriggerBtn);
           if (api) {
             const cat = buildModelCatalog(api);
             const entry = cat.moreFamilies.find((x) => x.fam.baseName === baseName);
@@ -3635,7 +3826,7 @@
   }
 
   function renderModelPopoversRaw() {
-    const api = discoverModelSelectorApi();
+    const api = discoverModelSelectorApi(activeModelTriggerBtn);
     if (!api) return;
     const { mainPop, subPop } = ensureModelPopovers();
     const cat = buildModelCatalog(api);
@@ -3667,6 +3858,24 @@
       })
       .join('');
 
+    /* Native menu row: always present on the native trigger. When the official menu carries options this
+       menu does not render (agent selector footer, context window, custom models) the hint reads
+       "More options"; the dot is reserved for fields this version has never seen (release drift). */
+    const nativeGaps = nativeModelMenuGaps(api);
+    const nativeHasNewFields = nativeGaps.soft.some((g) => g.startsWith('new:'));
+    const nativeRowHtml = canOpenNativeModelMenu(api, activeModelTriggerBtn || findModelTriggerBtn())
+      ? `<div class="ag-cm-divider"></div>
+      <button type="button" class="ag-cm-row" data-ag-cm-hover="none" data-ag-cm-native="1"${
+        nativeGaps.soft.length ? ` data-ag-cm-native-gaps="${escapeHtml(nativeGaps.soft.join(' '))}"` : ''
+      }>
+        <span style="display:inline-flex;align-items:center;gap:6px;">
+          <span>${L('官方菜单', 'Native menu')}</span>
+          ${nativeHasNewFields ? '<span class="ag-cm-dot"></span>' : ''}
+        </span>
+        <span class="ag-cm-key">${nativeGaps.soft.length ? L('更多选项', 'More options') : L('⌥ 点击', '⌥ Click')}</span>
+      </button>`
+      : '';
+
     const effSubActive = activeModelSubmenu === 'effort' && hasAdjustableEffort ? ' data-active-sub="true"' : '';
     const effDisabled = hasAdjustableEffort ? '' : ' data-disabled="true"';
     const moreSubActive = activeModelSubmenu === 'more' ? ' data-active-sub="true"' : '';
@@ -3692,6 +3901,7 @@
           ${SVG_CM_CHEVRON}
         </span>
       </button>
+      ${nativeRowHtml}
     `;
 
     if (activeModelSubmenu === 'effort' && hasAdjustableEffort) {
@@ -3743,7 +3953,7 @@
   }
 
   /* ---- menu accessibility: roles, inert when closed, focus preserved across re-renders ---- */
-  const MENU_KEY_ATTRS = ['data-ag-cm-family', 'data-ag-cm-subtrigger', 'data-ag-cm-effort', 'data-ag-cm-more-family'];
+  const MENU_KEY_ATTRS = ['data-ag-cm-family', 'data-ag-cm-subtrigger', 'data-ag-cm-effort', 'data-ag-cm-more-family', 'data-ag-cm-native'];
   let focusBeforeModelMenu = null;
   let lastKeyToggleTs = 0;
 
@@ -3871,12 +4081,20 @@
   const TRIGGER_SEL = 'button[data-testid="model-selector-trigger"], button[data-ag-pd-model-trigger="true"]';
 
   const onModelTriggerPointerDown = (e) => {
-    if (!FEAT.modelMenu) return;
+    if (!FEAT.modelMenu || isCustomCssDisabled()) return;
     const trigger = e.target && e.target.closest && e.target.closest(TRIGGER_SEL);
     if (trigger) {
       if (e.button !== undefined && e.button !== 0) return;
+      if (e.altKey && isNativeModelTriggerBtn(trigger)) {
+        if (modelPopoverOpen) closeClaudeModelPopover();
+        return;
+      }
       const api = discoverModelSelectorApi(trigger);
       if (!api) return;
+      if (shouldDeferToNativeModelMenu(e, trigger, api)) {
+        if (modelPopoverOpen) closeClaudeModelPopover();
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
@@ -3891,11 +4109,14 @@
   /* Mouse: the menu already toggled on pointerdown, so swallow the follow-up mousedown/click.
      Keyboard / assistive tech: activation arrives as a click with detail === 0 -> toggle here. */
   const onModelTriggerSwallowMouseClick = (e) => {
-    if (!FEAT.modelMenu) return;
+    if (!FEAT.modelMenu || isCustomCssDisabled()) return;
     const trigger = e.target && e.target.closest && e.target.closest(TRIGGER_SEL);
     if (!trigger) return;
+    if (e.altKey && isNativeModelTriggerBtn(trigger)) return;
+    if (Date.now() < bypassNativeModelTriggerUntil) return;
     const api = discoverModelSelectorApi(trigger);
     if (!api) return;
+    if (shouldDeferToNativeModelMenu(e, trigger, api)) return;
     e.preventDefault();
     e.stopPropagation();
     e.stopImmediatePropagation();
@@ -3906,11 +4127,12 @@
   };
 
   const onModelPopoverKeyDown = (e) => {
-    if (disposed || !FEAT.modelMenu) return;
+    if (disposed || !FEAT.modelMenu || isCustomCssDisabled()) return;
     const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key === '/') {
       const btn = findModelTriggerBtn();
-      if (btn && discoverModelSelectorApi(btn)) {
+      const btnApi = btn ? discoverModelSelectorApi(btn) : null;
+      if (btnApi && !shouldDeferToNativeModelMenu(null, btn, btnApi)) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -3921,7 +4143,8 @@
 
     const trig = e.target && e.target.closest && e.target.closest(TRIGGER_SEL);
     if (trig && plain && (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-      if (discoverModelSelectorApi(trig)) {
+      const trigApi = discoverModelSelectorApi(trig);
+      if (trigApi && !shouldDeferToNativeModelMenu(null, trig, trigApi)) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -3993,8 +4216,16 @@
       return;
     }
     if (plain && /^[1-5]$/.test(e.key)) {
+      const inEditable = Boolean(
+        active &&
+          (active.isContentEditable ||
+            active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            (active.closest && active.closest('[contenteditable="true"]')))
+      );
+      if (inEditable) return;
       const idx = Number(e.key) - 1;
-      const api = discoverModelSelectorApi();
+      const api = discoverModelSelectorApi(activeModelTriggerBtn);
       if (api) {
         const cat = currentCatalogSnapshot || buildModelCatalog(api);
         const fam = cat.primaryFamilies[idx];
@@ -4040,12 +4271,14 @@
     let session;
     let index;
     let text;
+    let rawItems = null;
     for (let f = activeReactFiber(button), depth = 0; f && depth < 65; f = f.return, depth++) {
       const props = f.memoizedProps;
       if (!state && props && props.revertState) state = props.revertState;
       if (session === undefined && props && typeof props.cascadeId === 'string') session = props.cascadeId;
       if (index === undefined && props && Number.isInteger(props.userStepIndex)) index = props.userStepIndex;
       if (text === undefined && props && Array.isArray(props.items)) {
+        rawItems = props.items.slice();
         text = props.items
           .filter((it) => it && it.chunk && it.chunk.case === 'text')
           .map((it) => it.chunk.value || '')
@@ -4062,14 +4295,22 @@
     if (!state || !state.canRevert || !state.revertPreviewState || !state.revertPreviewState.revert || !context || !session || index === undefined) {
       return null;
     }
+    const stepEl = button.closest && button.closest('[data-testid="user-input-step"]');
     if (text === undefined) {
-      const stepEl = button.closest && button.closest('[data-testid="user-input-step"]');
       const q =
         stepEl &&
         stepEl.querySelector('[data-testid="user-message-content"] [data-quotable="true"], [data-testid="user-message-content"]');
       text = (q && q.textContent) || '';
     }
-    return { state: state.revertPreviewState, context, session, index, text };
+    const nonTextItems = Array.isArray(rawItems)
+      ? rawItems.filter((it) => it && it.chunk && it.chunk.case === 'item')
+      : [];
+    const hasDomRichItems = Boolean(
+      stepEl &&
+        stepEl.querySelector('[data-uri], bdi.context-scope-mention, [data-testid="skill-scope-item-pill"], [data-testid="context-scope-item-cider"]')
+    );
+    const hasRichItems = nonTextItems.length > 0 || hasDomRichItems;
+    return { state: state.revertPreviewState, context, session, index, text, rawItems, nonTextItems, hasRichItems, stepEl };
   }
 
   function getComposerLexicalRoot(context) {
@@ -4118,25 +4359,62 @@
     if (el) el.textContent = value;
   }
 
+  function buildRebuiltRichItems(rawItems, nextText) {
+    if (!Array.isArray(rawItems) || rawItems.length === 0) return null;
+    const preserved = rawItems.filter((it) => it && it.chunk && it.chunk.case !== 'text');
+    if (preserved.length === 0) return null;
+    const out = preserved.slice();
+    const val = String(nextText ?? '');
+    if (val) {
+      out.push({
+        $typeName: 'exa.codeium_common_pb.TextOrScopeItem',
+        chunk: { case: 'text', value: val }
+      });
+    }
+    return out;
+  }
+
   async function performNativeRevert(target) {
     const handler = target.context.stepHandler;
     const orig = handler.revertToIndex;
-    let pending;
-    handler.revertToIndex = function (...args) {
+    let pending = null;
+    let resolveCalled = null;
+    const calledPromise = new Promise((r) => {
+      resolveCalled = r;
+    });
+    const wrapped = function (...args) {
       const res = orig.apply(this, args);
       if (args[0] === target.session && args[1] === target.index - 1) {
         pending = Promise.resolve(res);
+        resolveCalled(true);
       }
       return res;
     };
+    handler.revertToIndex = wrapped;
     try {
-      target.state.revert();
+      const ret = target.state.revert();
+      if (ret && typeof ret.then === 'function') {
+        await ret;
+      }
+      if (!pending) {
+        /* Support async native revert implementations that call revertToIndex on a later microtask/tick */
+        await Promise.race([calledPromise, new Promise((r) => setTimeout(r, 250))]);
+      }
     } finally {
-      handler.revertToIndex = orig;
+      if (handler.revertToIndex === wrapped) {
+        handler.revertToIndex = orig;
+      }
     }
-    if (!pending) throw new Error('revert_not_dispatched');
-    await pending;
-    await new Promise((r) => setTimeout(r, 0));
+    if (pending) {
+      await pending;
+      await new Promise((r) => setTimeout(r, 0));
+      return;
+    }
+    if (target.stepEl && !target.stepEl.isConnected) {
+      await new Promise((r) => setTimeout(r, 0));
+      return;
+    }
+    throw new Error('revert_not_dispatched');
   }
 
   async function submitComposerAfterRevert(context, composerEl) {
@@ -4196,11 +4474,15 @@
     const hasMedia = Boolean(
       stObj.bubble && stObj.bubble.querySelector('.agy-user-bubble-header, img, [data-testid*="attachment"], [data-testid*="media"]')
     );
+    const hasRichRefs = Boolean(cur && cur.hasRichItems);
     metaEl.innerHTML =
       (rState.conversationOnlyRevertEnabled
         ? `<button type="button" class="ag-claude-switch" role="switch" data-ag-revert-files-switch aria-label="${escapeHtml(L('同步撤回文件修改', 'Revert modified files'))}" aria-checked="${!convOnly}"><span></span></button><span>${L('同步撤回文件', 'Revert files')}</span><span style="opacity:0.45">·</span>`
         : '') +
       `<span>${escapeHtml(fileSummary)}</span>` +
+      (hasRichRefs
+        ? `<span style="opacity:0.75" title="${escapeHtml(L('自动保留原消息中的 @ 引用、斜杠命令与技能胶囊；按住 ⌥ 点撤回可打开官方撤回界面', 'Preserves original @ mentions, slash commands & skills; Option+click Revert for native UI'))}">· ${L('保留原引用', 'Keep mentions')}</span>`
+        : '') +
       (hasMedia
         ? `<span style="opacity:0.75" title="${escapeHtml(L('重发时自动保留原消息图片/附件；如需增删附件请点「移至底栏」', 'Keeps original attachments on resend; click Move to input to edit attachments'))}">· ${L('保留原附件', 'Keep attachments')}</span>`
         : '');
@@ -4292,7 +4574,23 @@
       }
       await performNativeRevert(current);
       if (disposed || activeInlineEdit !== stObj) return;
-      setComposerText(current.context, stObj.draftText);
+      const textUnchanged = stObj.draftText === (stObj.target.text || '');
+      const rebuiltRichItems =
+        shouldSubmit && current.hasRichItems ? buildRebuiltRichItems(current.rawItems, stObj.draftText) : null;
+      const agentPropsForRich = rebuiltRichItems ? discoverAgentInputProps(composerEl || rootEl) : null;
+      if (rebuiltRichItems && agentPropsForRich && typeof agentPropsForRich.handleSubmit === 'function') {
+        const ref = current.context && current.context.inputBoxRef && current.context.inputBoxRef.current;
+        const media = ref && typeof ref.getMediaAttachments === 'function' ? ref.getMediaAttachments() : [];
+        closeInlineEdit(false);
+        await new Promise((r) => setTimeout(r, 360));
+        if (disposed) return;
+        await agentPropsForRich.handleSubmit(rebuiltRichItems, Array.isArray(media) ? media : [], () => {});
+        return;
+      }
+      /* Preserve rich Lexical mention/slash/skill nodes restored by native revert when text was not modified */
+      if (!(current.hasRichItems && textUnchanged)) {
+        setComposerText(current.context, stObj.draftText);
+      }
       closeInlineEdit(false);
       if (shouldSubmit) {
         await submitComposerAfterRevert(current.context, composerEl);
@@ -4384,7 +4682,8 @@
       autoResize();
     });
     ta.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) {
+      if (ev.isComposing || ev.keyCode === 229) return;
+      if (ev.key === 'Enter' && !ev.shiftKey) {
         ev.preventDefault();
         ev.stopPropagation();
         applyInlineUndo(true);
@@ -4412,7 +4711,7 @@
   }
 
   const onRevertButtonClick = (e) => {
-    if (disposed || !FEAT.inlineUndo) return;
+    if (disposed || !FEAT.inlineUndo || e.altKey) return;
     const btn = e.target && e.target.closest && e.target.closest('button[data-testid="revert-button"]');
     if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return;
     const target = resolveNativeRevertTarget(btn);
@@ -4431,6 +4730,11 @@
 
   const onInlineEditDocKeyDown = (e) => {
     if (disposed || !activeInlineEdit || inlineUndoBusy) return;
+    if (!activeInlineEdit.editorBox || !activeInlineEdit.editorBox.isConnected) {
+      closeInlineEdit(false);
+      return;
+    }
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
@@ -4753,8 +5057,17 @@
     for (const view of views) {
       const r = view.getBoundingClientRect();
       if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        const box = view.querySelector('[id="antigravity.agentSidePanelInputBox"]') || view;
-        return { kind: 'native', el: box, viewEl: view, targetCid: view.getAttribute('data-cascade-id') || '' };
+        const box = view.querySelector('[id="antigravity.agentSidePanelInputBox"]');
+        const boxRect = box ? box.getBoundingClientRect() : null;
+        const inBox = Boolean(
+          boxRect && boxRect.width > 0 && boxRect.height > 0 && x >= boxRect.left && x <= boxRect.right && y >= boxRect.top && y <= boxRect.bottom
+        );
+        /* Leave left/right edge bands (~14%, capped at 96px) outside the composer free for official split-pane drag */
+        const splitEdge = Math.min(96, r.width * 0.14);
+        if (!inBox && r.width >= 360 && (x - r.left < splitEdge || r.right - x < splitEdge)) {
+          return null;
+        }
+        return { kind: 'native', el: box || view, viewEl: view, targetCid: view.getAttribute('data-cascade-id') || '' };
       }
     }
     const nativeBoxes = document.querySelectorAll('[id="antigravity.agentSidePanelInputBox"]');
@@ -4767,6 +5080,19 @@
     }
     return null;
   }
+  let dispatchingSyntheticPointerCancel = false;
+  function cancelNativeDndSilently() {
+    /* Cancel dnd-kit PointerSensor via synthetic pointercancel instead of Escape (which can stop live generation) */
+    dispatchingSyntheticPointerCancel = true;
+    try {
+      const cancelEv =
+        typeof PointerEvent === 'function'
+          ? new PointerEvent('pointercancel', { bubbles: true, cancelable: false })
+          : new Event('pointercancel', { bubbles: true });
+      window.dispatchEvent(cancelEv);
+    } catch {}
+    dispatchingSyntheticPointerCancel = false;
+  }
   const onPinnedRowPointerDown = (ev) => {
     if (disposed || ev.button !== 0 || ev.altKey) return;
     if (
@@ -4778,6 +5104,11 @@
     }
     const row = ev.target && ev.target.closest && ev.target.closest('[data-testid="conversation-row-sidebar"][data-cascade-id]');
     if (!row) return;
+    /* Only intercept Pinned rows (native unpinned rows keep native split-drag unless unified Recents replaces them) */
+    const isPinnedRow =
+      row.getAttribute('data-pinned') === 'true' ||
+      Boolean(row.closest && row.closest('[data-ag-sb-unified="pinned"]'));
+    if (!isPinnedRow) return;
     const cid = row.getAttribute('data-cascade-id');
     if (!cid) return;
     const a = row.querySelector('a[href]');
@@ -4859,9 +5190,8 @@
     if (hit.kind === 'project') {
       ev.preventDefault();
       ev.stopPropagation();
-      try {
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-      } catch {}
+      ev.stopImmediatePropagation();
+      cancelNativeDndSilently();
       const projView = document.getElementById('ag-claude-projects-view');
       const projId = projView && projView.getAttribute('data-ag-pd-proj-id');
       const compInput = hit.el.querySelector('#ag-pd-composer-input');
@@ -4892,9 +5222,8 @@
       if (targetCid && targetCid === st.id) return;
       ev.preventDefault();
       ev.stopPropagation();
-      try {
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-      } catch {}
+      ev.stopImmediatePropagation();
+      cancelNativeDndSilently();
       const store = getLayoutReduxStore();
       if (targetCid && store) {
         store.dispatch({ type: 'layout/setPendingSplitDrop', payload: null });
@@ -4917,6 +5246,7 @@
     }
   };
   const onPinnedRowPointerCancel = () => {
+    if (dispatchingSyntheticPointerCancel) return;
     pinnedDragState = null;
     clearPinnedComposerDropHighlights();
   };
@@ -5612,11 +5942,16 @@
     for (const [id, summary] of Object.entries(summaries)) {
       if (!isSidebarVisibleSummary(id, summary, state)) continue;
       if (isSummaryPinned(id, summary, state)) continue;
-      const rawTitle = (summary.annotations && summary.annotations.title) || summary.summary;
-      if (!rawTitle) continue;
-      const title = String(rawTitle);
-      const updatedAt = Math.max(protoSeconds(summary.lastModifiedTime), protoSeconds(summary.createdTime));
       const status = classifySidebarConversation(id, summary, state, activeId, hasFocus);
+      const rawTitle = (summary.annotations && summary.annotations.title) || summary.summary;
+      const isLiveOrActiveUntitled =
+        !rawTitle &&
+        (id === activeId ||
+          (status && (status.kind === 'running' || status.kind === 'pending')) ||
+          Number(summary.stepCount || 0) > 0);
+      if (!rawTitle && !isLiveOrActiveUntitled) continue;
+      const title = rawTitle ? String(rawTitle) : L('新对话', 'New conversation');
+      const updatedAt = Math.max(protoSeconds(summary.lastModifiedTime), protoSeconds(summary.createdTime));
       const priority = status && status.kind === 'pending' ? 3 : status && status.kind === 'running' ? 2 : 1;
       const projInfo = resolveSummaryProjectInfo(summary, bindings.projectLabels, state);
       list.push({
@@ -5784,6 +6119,7 @@
         const row = ev.target && ev.target.closest && ev.target.closest('[data-ag-recent-id]');
         if (row && (ev.key === 'Enter' || ev.key === ' ')) {
           ev.preventDefault();
+          if (projectsViewOpen) closeProjectsView();
           const cid = row.getAttribute('data-ag-recent-id');
           navigateSidebarConversation(cid, findSidebarBindings() || bindings);
           scheduleSidebarSync();
@@ -5875,6 +6211,15 @@
     }, 90);
   }
 
+  let sidebarHideRaf = 0;
+  function scheduleSidebarHideSync() {
+    if (disposed || sidebarHideRaf) return;
+    sidebarHideRaf = frame(() => {
+      sidebarHideRaf = 0;
+      if (!disposed && FEAT.hideSidebarProjects) syncSidebarHideNativeProjects();
+    });
+  }
+
   function syncSidebarEnhancements() {
     if (disposed) return;
     restoreLegacySidebarCjkNodes();
@@ -5890,14 +6235,17 @@
       return;
     }
     const bindings = findSidebarBindings();
-    if (!bindings) return;
+    if (!bindings) {
+      if (unifiedRecentsOn) clearSidebarHideNativeProjects();
+      return;
+    }
     if (sidebarStoreRef !== bindings.store) {
       if (sidebarStoreUnsub) sidebarStoreUnsub();
       sidebarStoreRef = bindings.store;
       if (typeof bindings.store.subscribe === 'function') {
         sidebarStoreUnsub = bindings.store.subscribe(() => {
           scheduleSidebarSync();
-          if (FEAT.hideSidebarProjects) syncSidebarHideNativeProjects();
+          if (FEAT.hideSidebarProjects) scheduleSidebarHideSync();
         });
       } else {
         sidebarStoreUnsub = null;
@@ -5922,7 +6270,7 @@
    *       text nodes & title/placeholder/aria-label attributes with zero page reload.
    * ========================================================================== */
   const UX_I18N_BASE_EXCLUDE =
-    'code, pre, kbd, samp, textarea, input, style, script, noscript, [contenteditable="true"], [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, [data-testid="skill-scope-item-pill"], bdi.context-scope-mention, .monaco-editor, .monaco-diff-editor, .xterm, [class*="onyx-key"], .prose, .markdown, [class*="chat-message"], [class*="group/file-title"], [data-testid="conversation-row-sidebar"] a[href^="/c/"], [data-testid="conversation-row-sidebar"] span.truncate, [data-testid="conversation-navigator-turn"], .msg-body, #raw, [data-testid="swarm-raw"], #swarm-title, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="model-selector-menu"], [data-testid="permissions-selector-trigger"]';
+    'code, pre, kbd, samp, textarea, input, style, script, noscript, [contenteditable="true"], [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, [data-testid="skill-scope-item-pill"], bdi.context-scope-mention, .monaco-editor, .monaco-diff-editor, .xterm, [class*="onyx-key"], .prose, .markdown, [class*="chat-message"], [class*="group/file-title"], [data-testid="conversation-row-sidebar"] a[href^="/c/"], [data-testid="conversation-row-sidebar"] span.truncate, [data-testid="conversation-navigator-turn"], .msg-body, #raw, #swarm-title, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="permissions-selector-trigger"]';
   const UX_I18N_ATTR_EXCLUDE =
     'code, pre, kbd, samp, style, script, noscript, [data-markdown-root], [data-testid="user-message-content"], .agy-user-bubble, [data-testid="skill-scope-item-pill"], bdi.context-scope-mention, .monaco-editor, .monaco-diff-editor, .xterm, #ag-live-metrics-pill, #ag-live-metrics-tooltip, [data-ag-i18n-ignore="1"], #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-claude-ux-settings-nav, #ag-claude-ux-settings-panel, #ag-claude-recent-section, #ag-recent-row-menu, #ag-project-action-menu, [data-testid="model-selector-trigger"], [data-testid="permissions-selector-trigger"]';
   let uxI18nObserver = null;
@@ -6516,9 +6864,14 @@
           window.__ag_render_metrics(window.__ag_last_metrics);
         } catch {}
       }
+    } else if (featKey === 'stepUnfold' && !on) {
+      document.querySelectorAll('[data-ag-inline-stream]').forEach((el) => el.removeAttribute('data-ag-inline-stream'));
     } else if (featKey === 'todoCard' && !on) {
       document.querySelectorAll('[data-ag-todo-dock]').forEach((d) => d.remove());
+      document.querySelectorAll('[data-ag-todo-mount]').forEach((m) => m.remove());
       document.querySelectorAll('ul[data-ag-todo-primary], ul[data-ag-todo-merged]').forEach((u) => restoreNativeUl(u));
+      document.querySelectorAll('[data-ag-todo-empty-wrap]').forEach((el) => el.removeAttribute('data-ag-todo-empty-wrap'));
+      document.querySelectorAll('[data-ag-todo-marker-line]').forEach((el) => el.removeAttribute('data-ag-todo-marker-line'));
     } else if (featKey === 'runningTimer' && !on) {
       document.querySelectorAll('.ag-orbit-dots, .ag-elapsed-timer').forEach((n) => n.remove());
     } else if (featKey === 'inlineUndo' && !on) {
@@ -6670,12 +7023,19 @@
     settingsStatsBtnWrap = null;
     const root = sb || null;
     if (!root) return;
+    root.removeAttribute('data-ag-stats-ready');
     root.querySelectorAll('.ag-settings-subhdr-chev').forEach((el) => el.remove());
     root
       .querySelectorAll(
         '[data-ag-stats-hidden], [data-ag-stats-subhdr], [data-ag-stats-list], [data-ag-stats-open], [data-ag-stats-active], [data-ag-stats-passthrough]'
       )
       .forEach((el) => {
+        if (el.__agStatsHandlers) {
+          el.removeEventListener('click', el.__agStatsHandlers.onClick);
+          el.removeEventListener('keydown', el.__agStatsHandlers.onKeyDown);
+          delete el.__agStatsHandlers;
+        }
+        delete el.__agStatsBound;
         el.removeAttribute('data-ag-stats-hidden');
         el.removeAttribute('data-ag-stats-subhdr');
         el.removeAttribute('data-ag-stats-list');
@@ -6729,6 +7089,7 @@
       cleanupSettingsStatsGroup(sidebar);
       return;
     }
+    sidebar.setAttribute('data-ag-stats-ready', '1');
 
     /* Mount top-level "统计 / Stats" collapsible row styled identically to native Settings nav items */
     const nativeNavBtn =
@@ -6792,18 +7153,27 @@
       else hdrEl.setAttribute('data-ag-stats-hidden', '1');
       if (!hdrEl.__agStatsBound) {
         hdrEl.__agStatsBound = true;
-        hdrEl.addEventListener('click', (e) => {
+        const onClick = (e) => {
+          if (e.target && e.target !== hdrEl && e.target.closest && e.target.closest('button, a, input, select')) {
+            return;
+          }
           e.preventDefault();
           e.stopPropagation();
           onToggle();
-        });
-        hdrEl.addEventListener('keydown', (e) => {
+        };
+        const onKeyDown = (e) => {
+          if (e.target && e.target !== hdrEl && e.target.closest && e.target.closest('button, a, input, select')) {
+            return;
+          }
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
             e.stopPropagation();
             onToggle();
           }
-        });
+        };
+        hdrEl.__agStatsHandlers = { onClick, onKeyDown };
+        hdrEl.addEventListener('click', onClick);
+        hdrEl.addEventListener('keydown', onKeyDown);
       }
     };
 
@@ -6856,6 +7226,17 @@
       return;
     }
     if (settingsNavWrap && settingsNavWrap.isConnected && settingsSidebarRef === sb) {
+      if (!settingsRightRef || !settingsRightRef.isConnected) {
+        const splitRootLive =
+          sb.closest('[data-split-root="true"], [data-split-root]') ||
+          (sb.parentElement && sb.parentElement.parentElement && sb.parentElement.parentElement.parentElement);
+        const rightOuterLive =
+          splitRootLive && splitRootLive.children && splitRootLive.children.length >= 2
+            ? splitRootLive.children[splitRootLive.children.length - 1]
+            : null;
+        const rightContentLive = (rightOuterLive && rightOuterLive.firstElementChild) || rightOuterLive;
+        if (rightContentLive) settingsRightRef = rightContentLive;
+      }
       syncSettingsStatsGroup(sb);
       return;
     }
@@ -7647,6 +8028,9 @@
     const strip = document.getElementById('ag-pd-media-strip');
     if (!strip || !project) return;
     const list = getProjectMediaList(project.id, false);
+    const sig = list && list.length ? list.map((m) => m.id).join(',') : '';
+    if (strip.dataset.agMediaSig === sig) return;
+    strip.dataset.agMediaSig = sig;
     if (!list || !list.length) {
       strip.style.display = 'none';
       strip.innerHTML = '';
@@ -7701,6 +8085,57 @@
     renderPdMentionPopover();
   }
 
+  function getMentionScopeIdentity(scopeItem) {
+    const inner = scopeItem && scopeItem.scopeItem;
+    if (!inner || !inner.case) return '';
+    const v = inner.value || {};
+    if (inner.case === 'file' || inner.case === 'directory') return `${inner.case}:${v.absoluteUri || ''}`;
+    if (inner.case === 'conversation') return `conversation:${v.id || ''}`;
+    if (inner.case === 'dynamicContext') return `dyn:${v.providerLabel || ''}:${v.uri || v.itemValue || v.itemLabel || ''}`;
+    if (inner.case === 'rule' || inner.case === 'skill' || inner.case === 'workflow') {
+      return `${inner.case}:${v.uri || v.name || v.id || ''}`;
+    }
+    try {
+      return `${inner.case}:${JSON.stringify(v)}`;
+    } catch {
+      return inner.case;
+    }
+  }
+
+  function allocateUniqueMentionToken(mMap, rawLabel, item) {
+    const cleanLabel = String(rawLabel || '').replace(/[\[\]\r\n]+/g, ' ').trim() || 'item';
+    const identity = getMentionScopeIdentity(item && item.scopeItem);
+    if (identity) {
+      for (const [existingTok, existingEntry] of mMap.entries()) {
+        if (getMentionScopeIdentity(existingEntry && existingEntry.scopeItem) === identity) {
+          return { token: existingTok, label: existingEntry.label || cleanLabel };
+        }
+      }
+    }
+    const baseToken = `@[${cleanLabel}]`;
+    if (!mMap.has(baseToken)) {
+      return { token: baseToken, label: cleanLabel };
+    }
+    /* Disambiguate colliding display names (e.g. src/a/index.ts vs src/b/index.ts) using parent path or index */
+    const rawDesc = String((item && item.desc) || '').replace(/[\[\]\r\n]+/g, ' ').trim();
+    const absUri = item && item.scopeItem && item.scopeItem.scopeItem && item.scopeItem.scopeItem.value && item.scopeItem.scopeItem.value.absoluteUri;
+    const hintPath = rawDesc || (absUri ? decodeFileUriToPath(absUri) : '');
+    if (hintPath) {
+      const segs = hintPath.split(/[\\/]/).filter(Boolean);
+      for (let take = 2; take <= Math.min(segs.length, 4); take++) {
+        const candidateLbl = segs.slice(-take).join('/');
+        const candidateTok = `@[${candidateLbl}]`;
+        if (!mMap.has(candidateTok)) {
+          return { token: candidateTok, label: candidateLbl };
+        }
+      }
+    }
+    let n = 2;
+    while (mMap.has(`@[${cleanLabel} (${n})]`)) n += 1;
+    const numbered = `${cleanLabel} (${n})`;
+    return { token: `@[${numbered}]`, label: numbered };
+  }
+
   function applyPdMentionSelection(index) {
     if (!pdMentionState.open) return;
     const item = pdMentionState.items[index];
@@ -7726,12 +8161,11 @@
       return;
     }
 
-    const cleanLabel = String(item.label || '').replace(/[\[\]\r\n]+/g, ' ').trim() || 'item';
-    const token = `@[${cleanLabel}]`;
     const mMap = getProjectMentionMap(project.id, true);
+    const { token, label: finalLabel } = allocateUniqueMentionToken(mMap, item.label, item);
     mMap.set(token, {
       token,
-      label: cleanLabel,
+      label: finalLabel,
       kind: item.kind || 'plugin',
       logo: item.logo || '',
       scopeItem: item.scopeItem
@@ -7755,11 +8189,10 @@
     let curVal = compInput.value || '';
     for (const item of items) {
       if (!item || !item.scopeItem) continue;
-      const cleanLabel = String(item.label || '').replace(/[\[\]\r\n]+/g, ' ').trim() || 'item';
-      const token = `@[${cleanLabel}]`;
+      const { token, label: finalLabel } = allocateUniqueMentionToken(mMap, item.label, item);
       mMap.set(token, {
         token,
-        label: cleanLabel,
+        label: finalLabel,
         kind: item.kind || 'conversation',
         logo: item.logo || '',
         scopeItem: item.scopeItem
@@ -8242,16 +8675,15 @@
     return null;
   }
 
+  const optimisticallyArchivedProjectIds = new Map(); // projectId -> ts
+
   async function renameNativeProject(project, nextName) {
     const trimmed = String(nextName || '').trim();
     if (!project || !project.id || project.isBuiltin || !trimmed) return { ok: false, error: 'invalid_name' };
     const pm = resolveProjectManagementService();
     if (!pm || typeof pm.updateProject !== 'function') return { ok: false, error: 'service_unavailable' };
-    const raw = getRawNativeProjectRecord(project.id, pm) || {
-      $typeName: 'exa.project_pb.Project',
-      id: project.id,
-      name: project.name
-    };
+    const raw = getRawNativeProjectRecord(project.id, pm);
+    if (!raw) return { ok: false, error: 'project_record_unavailable' };
     optimisticProjectNames.set(project.id, trimmed);
     if (projectsViewOpen) renderProjectsView();
     try {
@@ -8274,7 +8706,7 @@
     if (!pm || typeof pm.updateProject !== 'function') return false;
     const raw = getRawNativeProjectRecord(project.id, pm);
     if (!raw) return false;
-    optimisticallyDeletedProjectIds.add(project.id);
+    optimisticallyArchivedProjectIds.set(project.id, Date.now());
     if (activeProjectId === project.id) {
       activeProjectId = null;
       projectSelectedFolderPath = '';
@@ -8288,7 +8720,7 @@
       }
       return true;
     } catch {
-      optimisticallyDeletedProjectIds.delete(project.id);
+      optimisticallyArchivedProjectIds.delete(project.id);
       if (!disposed && projectsViewOpen) renderProjectsView();
       return false;
     }
@@ -8538,23 +8970,24 @@
     const input = projectsModalEl.querySelector('#ag-pm-rename-input');
     const saveBtn = projectsModalEl.querySelector('[data-ag-pm-rename-save]');
     const doSubmit = async () => {
-      if (!projectsModalState || projectsModalState.kind !== 'renameProject' || projectsModalState.saving) return;
-      const nextName = String(projectsModalState.name || '').trim();
+      const modalRef = projectsModalState;
+      if (!modalRef || modalRef.kind !== 'renameProject' || modalRef.saving) return;
+      const nextName = String(modalRef.name || '').trim();
       if (!nextName) return;
       if (nextName === st.project.name) {
         closeProjectsModal();
         return;
       }
-      projectsModalState.saving = true;
-      projectsModalState.error = '';
+      modalRef.saving = true;
+      modalRef.error = '';
       renderRenameProjectModal();
       const res = await renameNativeProject(st.project, nextName);
-      if (disposed || !projectsModalState || projectsModalState.kind !== 'renameProject') return;
+      if (disposed || projectsModalState !== modalRef) return;
       if (res && res.ok) {
         closeProjectsModal();
       } else {
-        projectsModalState.saving = false;
-        projectsModalState.error = L('重命名失败：', 'Rename failed: ') + String((res && res.error) || 'unknown');
+        modalRef.saving = false;
+        modalRef.error = L('重命名失败：', 'Rename failed: ') + String((res && res.error) || 'unknown');
         renderRenameProjectModal();
       }
     };
@@ -8589,10 +9022,21 @@
     const rawProjects = (state && state.sidebarProjects && state.sidebarProjects.projects) || [];
     const presentRawIds = new Set();
     const out = [];
+    const nowArchMs = Date.now();
     for (const p of rawProjects) {
       if (!p || !p.id) continue;
       presentRawIds.add(p.id);
-      if (optimisticallyDeletedProjectIds.has(p.id) || p.archived) continue;
+      if (p.archived) {
+        /* Once Redux reflects archived: true, release optimistic archive mask so un-archiving reappears immediately */
+        optimisticallyArchivedProjectIds.delete(p.id);
+        continue;
+      }
+      const optArchTs = optimisticallyArchivedProjectIds.get(p.id);
+      if (optArchTs !== undefined) {
+        if (nowArchMs - optArchTs < 10000) continue;
+        optimisticallyArchivedProjectIds.delete(p.id);
+      }
+      if (optimisticallyDeletedProjectIds.has(p.id)) continue;
       const rawName = String(p.name || '').trim();
       if (!rawName || rawName === 'swarm/swarm_board' || p.id === 'outside-of-project') continue;
       const isCliProject = p.id === 'default-cli-project';
@@ -8666,6 +9110,28 @@
     if (lbl) lbl.textContent = L('项目', 'Projects');
   }
 
+  let projectsOpenedPathname = '';
+  let sharedModalEscBound = false;
+
+  function isCustomizationsModalKind(st) {
+    return Boolean(st && (st.kind === 'addSkill' || st.kind === 'addAgent'));
+  }
+
+  function onSharedModalEscKeyDown(e) {
+    if (disposed || e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
+    if (!projectsModalEl || !projectsModalEl.isConnected) return;
+    if (projectsDocListenerBound) return; // handled by onProjectsGlobalKeyDown when Projects is enabled
+    e.preventDefault();
+    e.stopPropagation();
+    closeProjectsModal();
+  }
+
+  function ensureSharedModalEscBound() {
+    if (sharedModalEscBound) return;
+    sharedModalEscBound = true;
+    document.addEventListener('keydown', onSharedModalEscKeyDown, true);
+  }
+
   function closeProjectsModal() {
     projectsModalState = null;
     if (projectsModalEl) {
@@ -8674,15 +9140,17 @@
     }
   }
 
-  function closeProjectsView() {
+  function closeProjectsView(opts = {}) {
     clearNewProjectWatcher();
     closeProjectActionMenu();
     closePdMentionMenu();
-    if (!projectsViewOpen && !projectsModalEl) return;
-    closeProjectsModal();
+    const keepCustModal = !opts.forceCloseAllModals && isCustomizationsModalKind(projectsModalState);
+    if (!projectsViewOpen && (keepCustModal || !projectsModalEl)) return;
+    if (!keepCustModal) closeProjectsModal();
     projectFolderDropdownOpen = false;
     projectFolderSearch = '';
     projectsViewOpen = false;
+    projectsOpenedPathname = '';
     if (projectsViewEl) {
       projectsViewEl.setAttribute('data-open', 'false');
     }
@@ -8690,13 +9158,21 @@
   }
 
   function isNativeModalDialogOpen() {
-    const dialogs = document.querySelectorAll('[role="dialog"], .agy-dialog');
+    const dialogs = document.querySelectorAll('[role="dialog"], .agy-dialog, [role="menu"], [role="listbox"], [data-popover-popup]');
     for (const el of dialogs) {
-      if (!el || !el.isConnected || el.closest('#ag-claude-project-modal, #ag-claude-projects-view')) continue;
-      if (el.getAttribute('aria-hidden') === 'true') continue;
+      if (
+        !el ||
+        !el.isConnected ||
+        el.closest(
+          '#ag-claude-project-modal, #ag-claude-projects-view, #ag-claude-model-popover, #ag-claude-model-subpop, #ag-claude-quota-popover, #ag-recent-row-menu, #ag-project-action-menu'
+        )
+      ) {
+        continue;
+      }
+      if (el.getAttribute('aria-hidden') === 'true' || el.hasAttribute('inert')) continue;
       try {
         const cs = window.getComputedStyle(el);
-        if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) continue;
+        if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0')) continue;
       } catch {}
       return true;
     }
@@ -8754,7 +9230,16 @@
   }
 
   function onProjectsGlobalKeyDown(e) {
-    if (e.key !== 'Escape') return;
+    if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
+    /* Let sidebar inline rename, recent row menu, model/quota popovers handle Escape first */
+    if (
+      (e.target && e.target.closest && e.target.closest('[data-ag-recent-rename-input]')) ||
+      document.getElementById('ag-recent-row-menu') ||
+      modelPopoverOpen ||
+      quotaPopoverOpen
+    ) {
+      return;
+    }
     if (pdMentionState.open) {
       e.preventDefault();
       e.stopPropagation();
@@ -8763,7 +9248,7 @@
       e.preventDefault();
       e.stopPropagation();
       closeProjectActionMenu();
-    } else if (projectsModalEl) {
+    } else if (projectsModalEl && projectsModalEl.isConnected) {
       e.preventDefault();
       e.stopPropagation();
       closeProjectsModal();
@@ -8824,6 +9309,7 @@
     const beforeSearchProj = readSearchProj();
     let sawDialogOpen = false;
     let closeGraceTimer = 0;
+    let lastWatchSig = '';
 
     const focusProjectInOverlay = (proj) => {
       clearNewProjectWatcher();
@@ -8840,7 +9326,13 @@
         return;
       }
       const st = store.getState();
-      const isOpen = Boolean(st && st.newProject && st.newProject.isOpen);
+      const rawList = (st && st.sidebarProjects && st.sidebarProjects.projects) || [];
+      const isOpen = Boolean((st && st.newProject && st.newProject.isOpen) || isNativeModalDialogOpen());
+      const nextSearchProj = readSearchProj();
+      const watchSig = `${isOpen ? 1 : 0}|${nextSearchProj}|${rawList.length}|${rawList.map((p) => (p && p.id) || '').join(',')}`;
+      if (watchSig === lastWatchSig) return;
+      lastWatchSig = watchSig;
+
       if (isOpen) {
         sawDialogOpen = true;
         if (closeGraceTimer) {
@@ -8854,7 +9346,6 @@
         focusProjectInOverlay(created);
         return;
       }
-      const nextSearchProj = readSearchProj();
       if (sawDialogOpen && !isOpen && nextSearchProj && nextSearchProj !== beforeSearchProj) {
         const selectedExisting = curProjects.find((p) => p.id === nextSearchProj);
         if (selectedExisting) {
@@ -8871,7 +9362,7 @@
 
     const maxTimer = later(() => {
       clearNewProjectWatcher();
-    }, 300000);
+    }, 60000);
 
     newProjectWatchCleanup = () => {
       if (closeGraceTimer) {
@@ -8901,7 +9392,7 @@
     if (hasNewProjectSlice) {
       armNewProjectCompletionWatcher(store, bindings);
       store.dispatch({ type: 'newProject/reset' });
-      store.dispatch({ type: 'newProject/setCurrentStep', payload: 'folderSelection' });
+      store.dispatch({ type: 'newProject/setStep', payload: 'folderSelection' });
       store.dispatch({ type: 'newProject/setIsOpen', payload: true });
       return;
     }
@@ -8967,7 +9458,24 @@
     }));
   }
 
-  function startNewChatInProject(project, initialPrompt = '', mentionEntries = [], mediaEntries = []) {
+  function showProjectsFloatingNotice(msg) {
+    if (disposed || !document.body || !msg) return;
+    const old = document.getElementById('ag-projects-float-toast');
+    if (old) old.remove();
+    const toast = document.createElement('div');
+    toast.id = 'ag-projects-float-toast';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('data-ag-i18n-ignore', '1');
+    toast.style.cssText =
+      'position:fixed;bottom:24px;right:24px;z-index:2147483000;max-width:360px;padding:10px 14px;border-radius:10px;background:rgba(30,30,30,0.92);color:#fff;font-size:13px;line-height:1.4;box-shadow:0 8px 24px rgba(0,0,0,0.28);pointer-events:none;';
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    later(() => {
+      if (toast.isConnected) toast.remove();
+    }, 4500);
+  }
+
+  function startNewChatInProject(project, initialPrompt = '', mentionEntries = [], mediaEntries = [], rollbackDraft = null) {
     const { store, bindings } = resolveProjectsStoreAndBindings();
     const prompt = String(initialPrompt || '').trim();
     const submitChunks = buildComposerSubmitChunks(prompt, mentionEntries);
@@ -8978,6 +9486,23 @@
         ? bindings.router.state.location.pathname
         : '';
     const wasOnHome = prevPath === '/';
+
+    const restoreComposerDraftOnFailure = () => {
+      if (!rollbackDraft || !project || !project.id) return;
+      if (rollbackDraft.raw) projectComposerDrafts.set(project.id, rollbackDraft.raw);
+      if (Array.isArray(rollbackDraft.mediaArr) && rollbackDraft.mediaArr.length) {
+        projectComposerMedia.set(project.id, rollbackDraft.mediaArr.slice());
+      }
+      if (Array.isArray(rollbackDraft.mentionEntries) && rollbackDraft.mentionEntries.length) {
+        const mMap = getProjectMentionMap(project.id, true);
+        for (const en of rollbackDraft.mentionEntries) {
+          if (en && en.token) mMap.set(en.token, en);
+        }
+      }
+      showProjectsFloatingNotice(
+        L('未能找到主输入框，消息与附件已保留在项目草稿中，请重试。', 'Composer unavailable — your draft and attachments were preserved.')
+      );
+    };
 
     if (store && typeof store.dispatch === 'function' && project && project.id) {
       try {
@@ -9013,6 +9538,7 @@
       const readyDom = Boolean(box && (wasOnHome || box !== prevInputBox || tries >= 16));
       if (!atHome || !projectMatched || !readyDom) {
         if (++tries < 35) later(trySubmit, 70);
+        else restoreComposerDraftOnFailure();
         return;
       }
       /* Give the newly mounted Home composer one extra tick so its project & workspace hooks settle */
@@ -9082,73 +9608,99 @@
           };
           try {
             await handleSubmit(submitChunks, resolvedMedia, clearEditor);
-          } catch {} finally {
+          } catch {
+            restoreComposerDraftOnFailure();
+          } finally {
             if (mediaList.length) clearEditor();
           }
         })();
         return;
       }
       if (++tries < 35) later(trySubmit, 70);
+      else restoreComposerDraftOnFailure();
     };
     later(trySubmit, 110);
   }
 
+  const projectsContextQueueByDir = new Map();
+
   async function saveProjectContextDelta(project, mutator) {
-    if (!project || !project.dirPath || projectsContextBusy || typeof window.__agProjectCall !== 'function') {
-      return { ok: false, error: 'busy_or_unavailable' };
+    if (!project || !project.dirPath || typeof window.__agProjectCall !== 'function') {
+      return { ok: false, error: 'unavailable' };
     }
-    projectsContextBusy = true;
-    try {
-      let cur = projectsContextMap[project.dirPath];
-      if (!cur || !cur.ok) {
-        cur = await window.__agProjectCall('readContext', { dirPath: project.dirPath }, 8000);
+    const dirKey = project.dirPath;
+    const prevTail = projectsContextQueueByDir.get(dirKey) || Promise.resolve();
+    const runTask = async () => {
+      if (disposed) return { ok: false, error: 'disposed' };
+      projectsContextBusy = true;
+      try {
+        let cur = projectsContextMap[dirKey];
+        if (!cur || !cur.ok) {
+          cur = await window.__agProjectCall('readContext', { dirPath: dirKey }, 8000);
+        }
+        /* Never submit a full replacement save if current context failed to load (prevents wiping attachments/instructions) */
+        if (!cur || !cur.ok) {
+          const errMsg = (cur && cur.error) || 'context_read_failed';
+          showProjectsFloatingNotice(
+            L(`读取项目上下文失败（${errMsg}），已中止保存以防丢失现有文件。`, `Failed to load project context (${errMsg}); save aborted to protect existing files.`)
+          );
+          return { ok: false, error: errMsg };
+        }
+        const existingFiles = (Array.isArray(cur.files) ? cur.files : []).map((f) => ({
+          action: 'keep',
+          relPath: f.relPath,
+          name: f.name,
+          absPath: f.absPath
+        }));
+        const existingFolders = (Array.isArray(cur.extraFolders) ? cur.extraFolders : []).map((f) => ({
+          name: f.name,
+          absPath: f.absPath
+        }));
+        const draft = {
+          instructions: cur.instructions || '',
+          files: existingFiles,
+          extraFolders: existingFolders
+        };
+        const updated =
+          typeof mutator === 'function'
+            ? mutator(draft)
+            : mutator && typeof mutator === 'object'
+              ? Object.assign({}, draft, mutator)
+              : null;
+        if (!updated) return { ok: true, skipped: true };
+        const saved = await window.__agProjectCall(
+          'saveContext',
+          {
+            dirPath: dirKey,
+            instructions: updated.instructions,
+            files: updated.files.map((x) =>
+              x.action === 'keep'
+                ? { action: 'keep', relPath: x.relPath, name: x.name }
+                : x.action === 'add'
+                  ? { action: 'add', sourcePath: x.sourcePath, name: x.name }
+                  : { action: 'addContent', name: x.name, base64: x.base64 }
+            ),
+            extraFolders: updated.extraFolders
+          },
+          30000
+        );
+        if (!disposed && saved && saved.ok) {
+          projectsContextMap[dirKey] = saved;
+          if (projectsViewOpen) renderProjectsView();
+        }
+        return saved || { ok: false, error: 'save_failed' };
+      } finally {
+        projectsContextBusy = false;
       }
-      const existingFiles = (cur && Array.isArray(cur.files) ? cur.files : []).map((f) => ({
-        action: 'keep',
-        relPath: f.relPath,
-        name: f.name,
-        absPath: f.absPath
-      }));
-      const existingFolders = (cur && Array.isArray(cur.extraFolders) ? cur.extraFolders : []).map((f) => ({
-        name: f.name,
-        absPath: f.absPath
-      }));
-      const draft = {
-        instructions: (cur && cur.instructions) || '',
-        files: existingFiles,
-        extraFolders: existingFolders
-      };
-      const updated =
-        typeof mutator === 'function'
-          ? mutator(draft)
-          : mutator && typeof mutator === 'object'
-            ? Object.assign({}, draft, mutator)
-            : null;
-      if (!updated) return { ok: true, skipped: true };
-      const saved = await window.__agProjectCall(
-        'saveContext',
-        {
-          dirPath: project.dirPath,
-          instructions: updated.instructions,
-          files: updated.files.map((x) =>
-            x.action === 'keep'
-              ? { action: 'keep', relPath: x.relPath, name: x.name }
-              : x.action === 'add'
-                ? { action: 'add', sourcePath: x.sourcePath, name: x.name }
-                : { action: 'addContent', name: x.name, base64: x.base64 }
-          ),
-          extraFolders: updated.extraFolders
-        },
-        30000
-      );
-      if (!disposed && saved && saved.ok) {
-        projectsContextMap[project.dirPath] = saved;
-        if (projectsViewOpen) renderProjectsView();
+    };
+    const nextPromise = prevTail.catch(() => {}).then(runTask);
+    projectsContextQueueByDir.set(dirKey, nextPromise);
+    nextPromise.finally(() => {
+      if (projectsContextQueueByDir.get(dirKey) === nextPromise) {
+        projectsContextQueueByDir.delete(dirKey);
       }
-      return saved || { ok: false, error: 'save_failed' };
-    } finally {
-      projectsContextBusy = false;
-    }
+    });
+    return nextPromise;
   }
 
   async function saveFilesDeltaForProject(project, mutator) {
@@ -9398,7 +9950,8 @@
       if (f === 'weekly') {
         const dowsZh = ['日', '一', '二', '三', '四', '五', '六'];
         const dowsEn = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        const idx = Math.min(6, Math.max(0, Number(t.dayOfWeek) || 1));
+        const rawDow = Number(t.dayOfWeek);
+        const idx = Number.isFinite(rawDow) ? Math.min(6, Math.max(0, rawDow)) : 1;
         return `${L(`每周${dowsZh[idx]}`, `Weekly ${dowsEn[idx]}`)} ${t.time || '09:00'}`;
       }
       return t.customCron || 'Cron';
@@ -9713,6 +10266,8 @@
       if (!raw && !mediaArr.length) return;
       const mMap = getProjectMentionMap(project.id, false);
       const mentionEntries = mMap ? [...mMap.values()] : [];
+      const rollbackDraft = { raw, mentionEntries: mentionEntries.slice(), mediaArr: mediaArr.slice() };
+      if (compInput) compInput.value = '';
       projectComposerDrafts.delete(project.id);
       projectComposerMedia.delete(project.id);
       if (mMap) mMap.clear();
@@ -9723,7 +10278,7 @@
             ? `[${L('关联文件夹', 'Linked folder')}: ${activeFolder.absPath}]\n${raw}`
             : `[${L('关联文件夹', 'Linked folder')}: ${activeFolder.absPath}]`
           : raw;
-      startNewChatInProject(project, finalPrompt, mentionEntries, mediaArr);
+      startNewChatInProject(project, finalPrompt, mentionEntries, mediaArr, rollbackDraft);
     };
     if (compInput && sendBtn) {
       if (compInput.value !== savedDraft) compInput.value = savedDraft;
@@ -9951,10 +10506,40 @@
     });
 
     el.querySelectorAll('[data-ag-pd-del-sched]').forEach((b) => {
-      b.addEventListener('click', (e) => {
+      b.addEventListener('click', async (e) => {
         e.stopPropagation();
         const task = schedById.get(b.getAttribute('data-ag-pd-del-sched'));
-        if (task) deleteProjectScheduledTaskFromUi(project, task);
+        if (!task) return;
+        if (b.getAttribute('data-confirm') !== '1') {
+          b.setAttribute('data-confirm', '1');
+          b.textContent = task.externalSidecar ? L('确认删官方任务?', 'Delete native?') : L('确认?', 'Confirm?');
+          b.style.width = 'auto';
+          b.style.padding = '0 6px';
+          b.style.fontSize = '11px';
+          later(() => {
+            if (b.isConnected && b.getAttribute('data-confirm') === '1') {
+              b.removeAttribute('data-confirm');
+              b.textContent = '×';
+              b.style.width = '';
+              b.style.padding = '';
+              b.style.fontSize = '';
+            }
+          }, 3500);
+          return;
+        }
+        b.disabled = true;
+        const res = await deleteProjectScheduledTaskFromUi(project, task);
+        if (res && !res.ok && b.isConnected) {
+          b.disabled = false;
+          b.removeAttribute('data-confirm');
+          b.textContent = '×';
+          b.style.width = '';
+          b.style.padding = '';
+          b.style.fontSize = '';
+          showProjectsFloatingNotice(
+            L('删除定时任务失败：', 'Failed to delete task: ') + String(res.error || 'unknown')
+          );
+        }
       });
     });
 
@@ -10046,7 +10631,7 @@
           .join('')
       : `<div class="ag-proj-empty">${
           q
-            ? L(`没有匹配「${projectsSearchQuery}」的项目`, `No projects matching "${projectsSearchQuery}"`)
+            ? L(`没有匹配「${escapeHtml(projectsSearchQuery)}」的项目`, `No projects matching "${escapeHtml(projectsSearchQuery)}"`)
             : L('还没有本地项目文件夹，点击右上角「新建项目」添加一个吧。', 'No local project folders yet. Click "New project" to add one.')
         }</div>`;
 
@@ -10252,32 +10837,33 @@
     const saveBtn = projectsModalEl.querySelector('[data-ag-pm-save]');
     if (saveBtn) {
       saveBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
           renderProjectContextModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
+        modalRef.saving = true;
+        modalRef.error = '';
         renderProjectContextModal();
         /* Submit only `instructions` so in-flight context loads can never overwrite existing attachments or folders */
         const res = await window.__agProjectCall(
           'saveContext',
           {
-            dirPath: projectsModalState.dirPath,
-            instructions: projectsModalState.instructions
+            dirPath: modalRef.dirPath,
+            instructions: modalRef.instructions
           },
           20000
         );
-        if (disposed || !projectsModalState) return;
+        if (disposed || projectsModalState !== modalRef) return;
         if (res && res.ok) {
-          projectsContextMap[projectsModalState.dirPath] = res;
+          projectsContextMap[modalRef.dirPath] = res;
           closeProjectsModal();
           if (projectsViewOpen) renderProjectsView();
         } else {
-          projectsModalState.saving = false;
-          projectsModalState.error = L('保存失败：', 'Save failed: ') + String((res && res.error) || 'unknown');
+          modalRef.saving = false;
+          modalRef.error = L('保存失败：', 'Save failed: ') + String((res && res.error) || 'unknown');
           renderProjectContextModal();
         }
       });
@@ -10309,7 +10895,9 @@
   }
 
   async function deleteProjectScheduledTaskFromUi(project, task) {
-    if (!project || !project.dirPath || !task || typeof window.__agProjectCall !== 'function') return;
+    if (!project || !project.dirPath || !task || typeof window.__agProjectCall !== 'function') {
+      return { ok: false, error: 'unavailable' };
+    }
     const res = await window.__agProjectCall(
       'deleteScheduledTask',
       { dirPath: project.dirPath, taskId: task.id, sidecarId: task.sidecarId || '' },
@@ -10319,6 +10907,7 @@
       projectsContextMap[project.dirPath] = res;
       if (projectsViewOpen) renderProjectsView();
     }
+    return res || { ok: false, error: 'delete_failed' };
   }
 
   function openProjectScheduledModal(project, existingTask = null) {
@@ -10632,15 +11221,17 @@
     const folderSel = projectsModalEl.querySelector('#ag-sched-folder');
     if (folderSel) {
       folderSel.addEventListener('change', async () => {
-        if (!projectsModalState) return;
+        const modalRef = projectsModalState;
+        if (!modalRef) return;
         if (folderSel.value === '__add_folder__') {
           if (typeof window.__agProjectCall === 'function') {
             try {
               const picked = await window.__agProjectCall('pickFolder', {}, 120000);
-              if (!disposed && projectsModalState && picked && picked.ok && !picked.canceled && picked.folderPath) {
+              if (disposed || projectsModalState !== modalRef) return;
+              if (picked && picked.ok && !picked.canceled && picked.folderPath) {
                 const nextPath = picked.folderPath;
-                if (nextPath !== projectsModalState.dirPath) {
-                  const saveRes = await saveProjectContextDelta(projectsModalState.project, (draft) => {
+                if (nextPath !== modalRef.dirPath) {
+                  const saveRes = await saveProjectContextDelta(modalRef.project, (draft) => {
                     const nextExtra = draft.extraFolders.slice();
                     if (!nextExtra.some((f) => f.absPath === nextPath)) {
                       nextExtra.push({
@@ -10650,31 +11241,30 @@
                     }
                     return Object.assign({}, draft, { extraFolders: nextExtra });
                   });
-                  if (projectsModalState) {
-                    if (saveRes && saveRes.ok === false) {
-                      projectsModalState.error =
-                        L('关联文件夹保存失败：', 'Failed to link folder: ') + String(saveRes.error || 'unknown');
-                    } else {
-                      projectsModalState.folderPath = nextPath;
-                      projectsModalState.error = '';
-                    }
+                  if (disposed || projectsModalState !== modalRef) return;
+                  if (saveRes && saveRes.ok === false) {
+                    modalRef.error =
+                      L('关联文件夹保存失败：', 'Failed to link folder: ') + String(saveRes.error || 'unknown');
+                  } else {
+                    modalRef.folderPath = nextPath;
+                    modalRef.error = '';
                   }
-                } else if (projectsModalState) {
-                  projectsModalState.folderPath = nextPath;
-                  projectsModalState.error = '';
+                } else {
+                  modalRef.folderPath = nextPath;
+                  modalRef.error = '';
                 }
               }
             } catch (err) {
-              if (projectsModalState) {
-                projectsModalState.error =
+              if (!disposed && projectsModalState === modalRef) {
+                modalRef.error =
                   L('关联文件夹保存失败：', 'Failed to link folder: ') + String((err && err.message) || err);
               }
             }
           }
-          renderProjectScheduledModal();
+          if (!disposed && projectsModalState === modalRef) renderProjectScheduledModal();
           return;
         }
-        projectsModalState.folderPath = folderSel.value || projectsModalState.dirPath;
+        modalRef.folderPath = folderSel.value || modalRef.dirPath;
       });
     }
 
@@ -10726,58 +11316,74 @@
     const delBtn = projectsModalEl.querySelector('[data-ag-sched-del]');
     if (delBtn) {
       delBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
-        projectsModalState.saving = true;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
+        if (!modalRef.confirmDelete) {
+          modalRef.confirmDelete = true;
+          delBtn.textContent = L('再次点击确认删除', 'Click again to confirm');
+          return;
+        }
+        modalRef.saving = true;
+        modalRef.error = '';
         renderProjectScheduledModal();
-        await deleteProjectScheduledTaskFromUi(projectsModalState.project, {
-          id: projectsModalState.editingId,
-          sidecarId: projectsModalState.sidecarId
+        const res = await deleteProjectScheduledTaskFromUi(modalRef.project, {
+          id: modalRef.editingId,
+          sidecarId: modalRef.sidecarId
         });
-        if (!disposed) closeProjectsModal();
+        if (disposed || projectsModalState !== modalRef) return;
+        if (res && res.ok) {
+          closeProjectsModal();
+        } else {
+          modalRef.saving = false;
+          modalRef.confirmDelete = false;
+          modalRef.error = L('删除失败：', 'Delete failed: ') + String((res && res.error) || 'unknown');
+          renderProjectScheduledModal();
+        }
       });
     }
 
     if (saveBtn) {
       saveBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
           renderProjectScheduledModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
+        modalRef.saving = true;
+        modalRef.error = '';
         renderProjectScheduledModal();
         const res = await window.__agProjectCall(
           'saveScheduledTask',
           {
-            dirPath: projectsModalState.dirPath,
+            dirPath: modalRef.dirPath,
             task: {
-              id: projectsModalState.editingId || undefined,
-              sidecarId: projectsModalState.sidecarId || undefined,
-              name: projectsModalState.name,
-              description: projectsModalState.description,
-              instructions: projectsModalState.instructions,
-              folderPath: projectsModalState.folderPath,
-              model: projectsModalState.model,
-              frequency: projectsModalState.frequency,
-              time: projectsModalState.time,
-              dayOfWeek: projectsModalState.dayOfWeek,
-              minute: projectsModalState.minute,
-              customCron: projectsModalState.customCron,
-              timezone: projectsModalState.timezone
+              id: modalRef.editingId || undefined,
+              sidecarId: modalRef.sidecarId || undefined,
+              name: modalRef.name,
+              description: modalRef.description,
+              instructions: modalRef.instructions,
+              folderPath: modalRef.folderPath,
+              model: modalRef.model,
+              frequency: modalRef.frequency,
+              time: modalRef.time,
+              dayOfWeek: modalRef.dayOfWeek,
+              minute: modalRef.minute,
+              customCron: modalRef.customCron,
+              timezone: modalRef.timezone
             }
           },
           20000
         );
-        if (disposed || !projectsModalState) return;
+        if (disposed || projectsModalState !== modalRef) return;
         if (res && res.ok) {
-          projectsContextMap[projectsModalState.dirPath] = res;
+          projectsContextMap[modalRef.dirPath] = res;
           closeProjectsModal();
           if (projectsViewOpen) renderProjectsView();
         } else {
-          projectsModalState.saving = false;
-          projectsModalState.error = L('保存失败：', 'Save failed: ') + String((res && res.error) || 'unknown');
+          modalRef.saving = false;
+          modalRef.error = L('保存失败：', 'Save failed: ') + String((res && res.error) || 'unknown');
           renderProjectScheduledModal();
         }
       });
@@ -10786,6 +11392,7 @@
 
   function openProjectsView(targetProjectId) {
     projectsViewOpen = true;
+    projectsOpenedPathname = String((window.location && window.location.pathname) || '');
     activeProjectId = typeof targetProjectId === 'string' && targetProjectId ? targetProjectId : null;
     projectSelectedFolderPath = '';
     ensureProjectsSidebarObserver();
@@ -10915,6 +11522,74 @@
     const list = scrollBox && scrollBox.firstElementChild;
     if (!scrollBox || !sbParent || !list) return;
 
+    /* Guard against hiding native sidebar lists when Unified Recents failed to mount on a live React host */
+    const hasReactHost = Boolean(
+      document.getElementById('root') ||
+        Object.keys(list).some((k) => k.startsWith('__react')) ||
+        Object.keys(scrollBox).some((k) => k.startsWith('__react'))
+    );
+    if (hasReactHost && !document.getElementById('ag-claude-recent-section')) {
+      const bindings = findSidebarBindings();
+      if (bindings) {
+        syncRecentSection(
+          bindings,
+          bindings.store.getState(),
+          getActiveCascadeId(),
+          typeof document.hasFocus === 'function' ? document.hasFocus() : true
+        );
+      }
+      if (!document.getElementById('ag-claude-recent-section')) {
+        clearSidebarHideNativeProjects();
+        return;
+      }
+    }
+
+    const indexed = [];
+    for (const child of list.children) {
+      const rawIdx = child.getAttribute('data-index');
+      if (rawIdx === null || rawIdx === '') continue;
+      const idx = Number(rawIdx);
+      if (Number.isFinite(idx)) indexed.push({ idx, el: child });
+    }
+    if (!indexed.length) return;
+    indexed.sort((a, b) => a.idx - b.idx);
+
+    /* Sections that stay native above the cut: Pinned and (v2.34+) Coordinators, which the native list
+       renders BEFORE Pinned. Match by testid / data-title first so localized header text cannot misfire. */
+    const KEPT_HDR_RE = /^(pinned|置顶对话|coordinators|协调器|编排器)$/i;
+    const isKeptSectionHeader = (sh) =>
+      Boolean(
+        sh &&
+        (sh.querySelector('[data-testid="pinned-section-header"], [data-testid="coordinator-section-header"]') ||
+          KEPT_HDR_RE.test(String(sh.getAttribute('data-title') || '').trim()) ||
+          KEPT_HDR_RE.test(String(sh.textContent || '').trim()))
+      );
+    let cutItem = indexed.find((x) => Boolean(x.el.querySelector('[data-testid="sidebar-add-project-button"]')));
+    if (!cutItem) {
+      cutItem = indexed.find((x) => {
+        const sh = x.el.querySelector('[data-testid="section-header"]');
+        return Boolean(sh && !isKeptSectionHeader(sh));
+      });
+    }
+
+    if (cutItem) {
+      const pinnedH = cutItem.idx === 0 ? 0 : Math.max(0, Math.round(parseVirtualTranslateY(cutItem.el)));
+      list.dataset.agCutIdx = String(cutItem.idx);
+      list.dataset.agPinnedH = String(pinnedH);
+    }
+
+    const hasPinnedHdr = indexed.some((x) => {
+      const sh = x.el.querySelector('[data-testid="section-header"]');
+      return isKeptSectionHeader(sh);
+    });
+
+    if (list.dataset.agCutIdx === undefined && !hasPinnedHdr) {
+      /* Structure did not match any known section header — do NOT lock scrollTop or hide native list */
+      clearSidebarHideNativeProjects();
+      return;
+    }
+
+    /* Bind scroll lock & virtual-list observer only after confirming the native sidebar structure matches */
     if (sidebarHideScrollEl !== scrollBox) {
       if (sidebarHideScrollEl) sidebarHideScrollEl.removeEventListener('scroll', onSidebarHideScroll);
       sidebarHideScrollEl = scrollBox;
@@ -10952,38 +11627,8 @@
       } catch {}
     }
 
-    const indexed = [];
-    for (const child of list.children) {
-      const rawIdx = child.getAttribute('data-index');
-      if (rawIdx === null || rawIdx === '') continue;
-      const idx = Number(rawIdx);
-      if (Number.isFinite(idx)) indexed.push({ idx, el: child });
-    }
-    if (!indexed.length) return;
-    indexed.sort((a, b) => a.idx - b.idx);
-
-    const isPinnedHdrText = (txt) => /^(pinned|置顶对话)$/i.test(String(txt || '').trim());
-    let cutItem = indexed.find((x) => Boolean(x.el.querySelector('[data-testid="sidebar-add-project-button"]')));
-    if (!cutItem) {
-      cutItem = indexed.find((x) => {
-        const sh = x.el.querySelector('[data-testid="section-header"]');
-        return Boolean(sh && !isPinnedHdrText(sh.textContent));
-      });
-    }
-
-    if (cutItem) {
-      const pinnedH = cutItem.idx === 0 ? 0 : Math.max(0, Math.round(parseVirtualTranslateY(cutItem.el)));
-      list.dataset.agCutIdx = String(cutItem.idx);
-      list.dataset.agPinnedH = String(pinnedH);
-    }
-
     if (list.dataset.agCutIdx === undefined) {
       // Only pinned section exists in virtual list (no native Projects/Conversations headers rendered)
-      const hasPinnedHdr = indexed.some((x) => {
-        const sh = x.el.querySelector('[data-testid="section-header"]');
-        return Boolean(sh && isPinnedHdrText(sh.textContent));
-      });
-      if (!hasPinnedHdr) return;
       const last = indexed[indexed.length - 1];
       const estH = Math.max(0, Math.round(parseVirtualTranslateY(last.el) + ((last.el.getBoundingClientRect && last.el.getBoundingClientRect().height) || 33) + 12));
       sbParent.setAttribute('data-ag-sb-unified', estH > 0 ? 'pinned' : 'empty');
@@ -10995,15 +11640,35 @@
       return;
     }
 
-    const cutIdx = Number(list.dataset.agCutIdx);
-    const pinnedH = Number(list.dataset.agPinnedH) || 0;
+    let cutIdx = Number(list.dataset.agCutIdx);
+    let pinnedH = Number(list.dataset.agPinnedH) || 0;
+    /* If a newly pinned row pushed past the cached cutIdx while the cut header scrolled out, expand cutIdx safely */
+    if (!cutItem) {
+      let maxPinnedIdx = -1;
+      let maxPinnedBottom = pinnedH;
+      for (const { idx, el } of indexed) {
+        const rowEl = el.querySelector('[data-testid="conversation-row-sidebar"][data-pinned="true"]');
+        if (rowEl) {
+          if (idx > maxPinnedIdx) maxPinnedIdx = idx;
+          const b = Math.round(parseVirtualTranslateY(el) + ((el.getBoundingClientRect && el.getBoundingClientRect().height) || 33));
+          if (b > maxPinnedBottom) maxPinnedBottom = b;
+        }
+      }
+      if (maxPinnedIdx >= cutIdx) {
+        cutIdx = maxPinnedIdx + 1;
+        pinnedH = maxPinnedBottom;
+        list.dataset.agCutIdx = String(cutIdx);
+        list.dataset.agPinnedH = String(pinnedH);
+      }
+    }
     sbParent.setAttribute('data-ag-sb-unified', pinnedH > 0 ? 'pinned' : 'empty');
     sbParent.style.setProperty('--ag-sb-pinned-height', `${pinnedH}px`);
     list.style.removeProperty('--ag-sb-proj-shift');
 
     for (const { idx, el } of indexed) {
       el.removeAttribute('data-ag-sb-shift-up');
-      if (idx >= cutIdx) {
+      const isPinnedRow = Boolean(el.querySelector('[data-testid="conversation-row-sidebar"][data-pinned="true"]'));
+      if (idx >= cutIdx && !isPinnedRow) {
         el.setAttribute('data-ag-sb-hide-proj', '1');
       } else {
         el.removeAttribute('data-ag-sb-hide-proj');
@@ -11011,8 +11676,8 @@
     }
   }
 
-  function teardownProjectsWorkspace() {
-    closeProjectsView();
+  function teardownProjectsWorkspace(opts = {}) {
+    closeProjectsView({ forceCloseAllModals: Boolean(opts.forceCloseAllModals) });
     projectMgmtSvcRef = null;
     cascadeRpcSvcRef = null;
     projectComposerMentions.clear();
@@ -11020,6 +11685,7 @@
     pdMentionCache.rulesByKey.clear();
     pdMentionCache.pluginsByKey.clear();
     optimisticallyDeletedProjectIds.clear();
+    optimisticallyArchivedProjectIds.clear();
     optimisticProjectNames.clear();
     const btn = document.getElementById('ag-claude-projects-nav-btn');
     if (btn) btn.remove();
@@ -11038,7 +11704,17 @@
       document.removeEventListener('click', onProjectsGlobalClick, true);
       document.removeEventListener('keydown', onProjectsGlobalKeyDown, true);
       window.removeEventListener('resize', positionProjectsOverlay);
+      window.removeEventListener('popstate', onProjectsNavRouteChange);
       projectsDocListenerBound = false;
+    }
+  }
+
+  function onProjectsNavRouteChange() {
+    if (!projectsViewOpen) return;
+    const curPath = String((window.location && window.location.pathname) || '');
+    const curSearch = String((window.location && window.location.search) || '');
+    if (curPath !== projectsOpenedPathname || /(?:^|[?&])settingsOpen=true(?:&|$)/i.test(curSearch)) {
+      closeProjectsView();
     }
   }
 
@@ -11094,6 +11770,7 @@
   }
 
   function openAddSkillModal() {
+    ensureSharedModalEscBound();
     closeProjectsModal();
     projectsModalState = {
       kind: 'addSkill',
@@ -11266,37 +11943,38 @@
     }
     if (saveBtn) {
       saveBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
           renderAddSkillModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
-        projectsModalState.successMsg = '';
+        modalRef.saving = true;
+        modalRef.error = '';
+        modalRef.successMsg = '';
         renderAddSkillModal();
         const res = await window.__agProjectCall(
           'createLocalSkill',
           {
-            name: projectsModalState.name,
-            description: projectsModalState.description,
-            instructions: projectsModalState.instructions
+            name: modalRef.name,
+            description: modalRef.description,
+            instructions: modalRef.instructions
           },
           15000
         );
-        if (disposed || !projectsModalState) return;
-        projectsModalState.saving = false;
+        if (disposed || projectsModalState !== modalRef) return;
+        modalRef.saving = false;
         if (res && res.ok) {
-          projectsModalState.name = '';
-          projectsModalState.description = '';
-          projectsModalState.instructions = '';
-          projectsModalState.createdDir = res.dirPath || '';
-          projectsModalState.successMsg = L(`已创建技能「${res.folderName}」，重新进入页面或稍候即可在列表中看到。`, `Skill "${res.folderName}" created successfully.`);
+          modalRef.name = '';
+          modalRef.description = '';
+          modalRef.instructions = '';
+          modalRef.createdDir = res.dirPath || '';
+          modalRef.successMsg = L(`已创建技能「${res.folderName}」，重新进入页面或稍候即可在列表中看到。`, `Skill "${res.folderName}" created successfully.`);
           renderAddSkillModal();
         } else {
           const code = (res && res.error) || 'unknown';
-          projectsModalState.error =
+          modalRef.error =
             code === 'skill_already_exists'
               ? L('同名技能目录已存在，请换一个名称。', 'A skill with this folder name already exists.')
               : L('创建失败：', 'Create failed: ') + String(code);
@@ -11308,32 +11986,33 @@
     const importBtn = projectsModalEl.querySelector('[data-ag-skill-import]');
     if (importBtn) {
       importBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用', 'Local write bridge unavailable');
           renderAddSkillModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
-        projectsModalState.successMsg = '';
+        modalRef.saving = true;
+        modalRef.error = '';
+        modalRef.successMsg = '';
         renderAddSkillModal();
         const res = await window.__agProjectCall('importLocalSkill', {}, 120000);
-        if (disposed || !projectsModalState) return;
-        projectsModalState.saving = false;
+        if (disposed || projectsModalState !== modalRef) return;
+        modalRef.saving = false;
         if (res && res.ok && res.canceled) {
           renderAddSkillModal();
           return;
         }
         if (res && res.ok) {
-          projectsModalState.createdDir = res.dirPath || '';
-          projectsModalState.successMsg = res.alreadyInstalled
+          modalRef.createdDir = res.dirPath || '';
+          modalRef.successMsg = res.alreadyInstalled
             ? L(`「${res.folderName}」已在全局技能目录中。`, `"${res.folderName}" is already in the skills folder.`)
             : L(`已成功导入技能「${res.folderName}」。`, `Imported skill "${res.folderName}" successfully.`);
           renderAddSkillModal();
         } else {
           const code = (res && res.error) || 'unknown';
-          projectsModalState.error =
+          modalRef.error =
             code === 'missing_skill_md'
               ? L('所选文件夹根目录未找到 SKILL.md，请选择包含 SKILL.md 的技能目录。', 'No SKILL.md found in the selected folder.')
               : L('导入失败：', 'Import failed: ') + String(code);
@@ -11344,6 +12023,7 @@
   }
 
   function openAddAgentModal() {
+    ensureSharedModalEscBound();
     closeProjectsModal();
     projectsModalState = {
       kind: 'addAgent',
@@ -11592,42 +12272,43 @@
 
     if (saveBtn) {
       saveBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用，请重启 Anti-Claude 守护进程', 'Local write bridge unavailable');
           renderAddAgentModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
-        projectsModalState.successMsg = '';
+        modalRef.saving = true;
+        modalRef.error = '';
+        modalRef.successMsg = '';
         renderAddAgentModal();
         const res = await window.__agProjectCall(
           'createLocalAgent',
           {
-            name: projectsModalState.name,
-            description: projectsModalState.description,
-            roleMode: projectsModalState.roleMode,
-            tools: projectsModalState.tools,
-            systemPrompt: projectsModalState.systemPrompt
+            name: modalRef.name,
+            description: modalRef.description,
+            roleMode: modalRef.roleMode,
+            tools: modalRef.tools,
+            systemPrompt: modalRef.systemPrompt
           },
           15000
         );
-        if (disposed || !projectsModalState) return;
-        projectsModalState.saving = false;
+        if (disposed || projectsModalState !== modalRef) return;
+        modalRef.saving = false;
         if (res && res.ok) {
-          projectsModalState.name = '';
-          projectsModalState.description = '';
-          projectsModalState.systemPrompt = '';
-          projectsModalState.createdPath = res.filePath || res.dirPath || '';
-          projectsModalState.successMsg = L(
+          modalRef.name = '';
+          modalRef.description = '';
+          modalRef.systemPrompt = '';
+          modalRef.createdPath = res.filePath || res.dirPath || '';
+          modalRef.successMsg = L(
             `已创建子 Agent「${res.name}」（~/.gemini/config/agents/${res.name}.md），稍候或重进页面即可看到。`,
             `Subagent "${res.name}" created in ~/.gemini/config/agents/${res.name}.md.`
           );
           renderAddAgentModal();
         } else {
           const code = (res && res.error) || 'unknown';
-          projectsModalState.error =
+          modalRef.error =
             code === 'reserved_agent_name'
               ? L('该名称与系统内置 Agent（self / browser / research 等）冲突，请换一个名称。', 'Name conflicts with a built-in agent (self, browser, research, etc.).')
               : code === 'agent_already_exists'
@@ -11641,31 +12322,32 @@
     const importBtn = projectsModalEl.querySelector('[data-ag-agent-import]');
     if (importBtn) {
       importBtn.addEventListener('click', async () => {
-        if (!projectsModalState || projectsModalState.saving) return;
+        const modalRef = projectsModalState;
+        if (!modalRef || modalRef.saving) return;
         if (typeof window.__agProjectCall !== 'function') {
-          projectsModalState.error = L('本地写入桥接不可用', 'Local write bridge unavailable');
+          modalRef.error = L('本地写入桥接不可用', 'Local write bridge unavailable');
           renderAddAgentModal();
           return;
         }
-        projectsModalState.saving = true;
-        projectsModalState.error = '';
-        projectsModalState.successMsg = '';
+        modalRef.saving = true;
+        modalRef.error = '';
+        modalRef.successMsg = '';
         renderAddAgentModal();
         const res = await window.__agProjectCall('importLocalAgent', {}, 120000);
-        if (disposed || !projectsModalState) return;
-        projectsModalState.saving = false;
+        if (disposed || projectsModalState !== modalRef) return;
+        modalRef.saving = false;
         if (res && res.ok && res.canceled) {
           renderAddAgentModal();
           return;
         }
         if (res && res.ok) {
           const names = (res.imported || []).map((x) => x.name).join('、');
-          projectsModalState.createdPath = (res.imported && res.imported[0] && res.imported[0].filePath) || res.dirPath || '';
-          projectsModalState.successMsg = L(`已成功导入子 Agent：${names}`, `Imported subagent(s): ${names}`);
+          modalRef.createdPath = (res.imported && res.imported[0] && res.imported[0].filePath) || res.dirPath || '';
+          modalRef.successMsg = L(`已成功导入子 Agent：${names}`, `Imported subagent(s): ${names}`);
           renderAddAgentModal();
         } else {
           const code = (res && res.error) || 'unknown';
-          projectsModalState.error =
+          modalRef.error =
             code === 'missing_md_file'
               ? L('请选择 .md 格式的子 Agent 定义文件。', 'Please select .md agent definition file(s).')
               : L('导入失败：', 'Import failed: ') + String(code);
@@ -11870,8 +12552,13 @@
     syncSidebarHideNativeProjects();
     syncCustomizationsEnhancement();
     if (!FEAT.projects) {
-      teardownProjectsWorkspace();
+      if (projectsViewOpen || projectsViewEl || projectsDocListenerBound || document.getElementById('ag-claude-projects-nav-btn')) {
+        teardownProjectsWorkspace();
+      }
       return;
+    }
+    if (projectsViewOpen) {
+      onProjectsNavRouteChange();
     }
     const autoBtn = document.querySelector('[data-testid="automations-button"]');
     if (!autoBtn || !autoBtn.parentElement) return;
@@ -11902,6 +12589,7 @@
       document.addEventListener('click', onProjectsGlobalClick, true);
       document.addEventListener('keydown', onProjectsGlobalKeyDown, true);
       window.addEventListener('resize', positionProjectsOverlay);
+      window.addEventListener('popstate', onProjectsNavRouteChange);
     }
     if (projectsViewOpen) {
       ensureProjectsSidebarObserver();
@@ -12095,7 +12783,13 @@
     removeRecentSection();
     clearSidebarHideNativeProjects();
     teardownCustomizationsEnhancement();
-    teardownProjectsWorkspace();
+    teardownProjectsWorkspace({ forceCloseAllModals: true });
+    if (sharedModalEscBound) {
+      document.removeEventListener('keydown', onSharedModalEscKeyDown, true);
+      sharedModalEscBound = false;
+    }
+    const floatToast = document.getElementById('ag-projects-float-toast');
+    if (floatToast) floatToast.remove();
     detachSettingsPanel();
     const ttEl = document.getElementById('ag-live-metrics-tooltip');
     if (ttEl) {

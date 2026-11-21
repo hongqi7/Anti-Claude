@@ -151,7 +151,7 @@ function readProcessCommandLine(pid) {
     }
   }
   try {
-    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+    return execFileSync('ps', ['-ww', '-p', String(pid), '-o', 'command='], {
       encoding: 'utf8',
       timeout: 1500,
       stdio: ['ignore', 'pipe', 'ignore']
@@ -186,6 +186,11 @@ function removeOwnPidFile(pidFile = PID_FILE) {
   } catch {}
 }
 
+const RELAUNCH_INTENT_FILE = path.join(STATE_DIR, 'relaunch-intent.json');
+let activeRelaunchPromise = null;
+let wakeMacBootstrap = null;
+let shuttingDown = false;
+
 export function claimPidFile({
   pidFile = PID_FILE,
   stateDir = STATE_DIR,
@@ -211,8 +216,17 @@ export function claimPidFile({
       process.on('exit', () => removeOwnPidFile(PID_FILE));
       for (const sig of ['SIGTERM', 'SIGINT']) {
         process.on(sig, () => {
-          removeOwnPidFile(PID_FILE);
-          process.exit(0);
+          if (shuttingDown) return;
+          shuttingDown = true;
+          const finish = () => {
+            removeOwnPidFile(PID_FILE);
+            process.exit(0);
+          };
+          if (activeRelaunchPromise) {
+            Promise.race([activeRelaunchPromise, new Promise((r) => setTimeout(r, 6000))]).finally(finish);
+          } else {
+            finish();
+          }
         });
       }
     }
@@ -438,6 +452,36 @@ function startMacCdpBootstrap() {
     return Infinity;
   };
 
+  const parseLaunchExtraArgs = (cmd, mainBin) => {
+    const rest = String(cmd || '').slice(mainBin.length).trim();
+    if (!rest) return { extraArgs: [], hasCustomProfile: false, hasAmbiguousArgs: false };
+    const tokens = rest.split(/\s+/).filter(Boolean);
+    const extraArgs = [];
+    let hasCustomProfile = false;
+    let hasAmbiguousArgs = false;
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (/^-psn_/.test(tok)) continue;
+      if (/^--remote-debugging-port(?:=|$)/.test(tok)) {
+        if (!tok.includes('=') && i + 1 < tokens.length && /^\d+$/.test(tokens[i + 1])) i += 1;
+        continue;
+      }
+      if (/^--(user-data-dir|extensions-dir|profile-directory)(?:=|$)/.test(tok)) {
+        hasCustomProfile = true;
+        continue;
+      }
+      if (tok.startsWith('-')) {
+        extraArgs.push(tok);
+      } else if (fs.existsSync(tok)) {
+        extraArgs.push(tok);
+      } else {
+        /* Space-containing path or non-flag argument that `ps` flattens without quoting */
+        hasAmbiguousArgs = true;
+      }
+    }
+    return { extraArgs, hasCustomProfile, hasAmbiguousArgs };
+  };
+
   const parseMainProcesses = (stdout) => {
     const list = [];
     for (const line of String(stdout || '').split('\n')) {
@@ -449,7 +493,14 @@ function startMacCdpBootstrap() {
       for (const appBundle of candidateApps) {
         const mainBin = path.join(appBundle, 'Contents', 'MacOS', 'Antigravity');
         if (cmd === mainBin || cmd.startsWith(mainBin + ' ')) {
-          list.push({ pid, age, appBundle, hasCdp: cmd.includes('--remote-debugging-port') });
+          const argInfo = parseLaunchExtraArgs(cmd, mainBin);
+          list.push({
+            pid,
+            age,
+            appBundle,
+            hasCdp: cmd.includes('--remote-debugging-port'),
+            ...argInfo
+          });
           break;
         }
       }
@@ -486,11 +537,19 @@ function startMacCdpBootstrap() {
     }
   };
 
+  const psEnv = Object.assign({}, process.env);
+  delete psEnv.COLUMNS;
+
   const queryMainProcs = () =>
     new Promise((resolve) => {
-      execFile('ps', ['-axo', 'pid=,etime=,command='], { timeout: 2000 }, (err, stdout) => {
-        resolve(!err && stdout ? parseMainProcesses(stdout) : []);
-      });
+      execFile(
+        'ps',
+        ['-axww', '-o', 'pid=,etime=,command='],
+        { timeout: 2500, maxBuffer: 16 * 1024 * 1024, env: psEnv },
+        (err, stdout) => {
+          resolve(!err && stdout ? parseMainProcesses(stdout) : []);
+        }
+      );
     });
 
   const waitPortAndSync = (triesLeft = 40) => {
@@ -503,19 +562,110 @@ function startMacCdpBootstrap() {
     }
   };
 
+  const openAppWithRetry = async (appBundle, extraArgs = []) => {
+    try {
+      fs.rmSync(portFile, { force: true });
+    } catch {}
+    const launchArgs = [...extraArgs, '--remote-debugging-port=0'];
+    const attempts = [
+      ['-n', '-a', appBundle, '--args', ...launchArgs],
+      ['-n', '-a', appBundle, '--args', ...launchArgs],
+      ['-a', appBundle, '--args', ...launchArgs]
+    ];
+    for (let i = 0; i < attempts.length; i++) {
+      const err = await new Promise((resolve) => {
+        execFile('/usr/bin/open', attempts[i], { timeout: 10000 }, (e) => resolve(e || null));
+      });
+      if (!err) {
+        waitPortAndSync(40);
+        return true;
+      }
+      console.warn(`[Anti-Claude Daemon] open attempt ${i + 1} failed for ${appBundle}: ${err.message || err}`);
+      if (i < attempts.length - 1) {
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+    return false;
+  };
+
+  const clearRelaunchIntent = () => {
+    try {
+      fs.rmSync(RELAUNCH_INTENT_FILE, { force: true });
+    } catch {}
+  };
+
+  const recoverInterruptedRelaunch = async () => {
+    const intent = readJsonOrFallback(RELAUNCH_INTENT_FILE, null);
+    if (!intent || typeof intent.startedAt !== 'number') return;
+    clearRelaunchIntent();
+    if (Date.now() - intent.startedAt > 30000) return;
+    const procs = await queryMainProcs();
+    if (procs.length > 0) return;
+    const bundle =
+      (typeof intent.appBundle === 'string' && fs.existsSync(intent.appBundle) && intent.appBundle) ||
+      candidateApps.find((p) => fs.existsSync(p)) ||
+      candidateApps[0];
+    console.log(`[Anti-Claude Daemon] Recovering interrupted relaunch for ${bundle}`);
+    await openAppWithRetry(bundle, Array.isArray(intent.extraArgs) ? intent.extraArgs : []);
+  };
+
+  let emptyStreak = 0;
+  let pollTimer = null;
+
+  const scheduleNext = (delayMs) => {
+    if (shuttingDown) return;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(checkFreshLaunch, delayMs);
+    pollTimer.unref?.();
+  };
+
+  wakeMacBootstrap = () => {
+    emptyStreak = 0;
+    if (!busy && !shuttingDown) scheduleNext(750);
+  };
+
+  const computeNextDelay = (procs) => {
+    if (!activeConfig.enabled || attachedTargets.size > 0) return 15000;
+    if (procs.some((p) => p.hasCdp)) return 6000;
+    if (procs.length === 0) {
+      emptyStreak = Math.min(emptyStreak + 1, 6);
+      if (emptyStreak <= 2) return 1200;
+      if (emptyStreak <= 4) return 2200;
+      return 3500;
+    }
+    emptyStreak = 0;
+    return 750;
+  };
+
   const checkFreshLaunch = () => {
-    if (busy) return;
+    if (busy || shuttingDown) return;
+    rebuildBundleIfNeeded();
+    if (!activeConfig.enabled) {
+      scheduleNext(15000);
+      return;
+    }
+    if (attachedTargets.size > 0) {
+      scheduleNext(15000);
+      return;
+    }
     const now = Date.now();
-    if (now - lastAttemptAt < 2500) return;
+    if (now - lastAttemptAt < 2500) {
+      scheduleNext(1000);
+      return;
+    }
 
     for (const [pid, ts] of attemptedPids.entries()) {
       if (now - ts > 120000) attemptedPids.delete(pid);
     }
     recentAttempts = recentAttempts.filter((ts) => now - ts < 45000);
-    if (recentAttempts.length >= 3) return;
+    if (recentAttempts.length >= 3) {
+      scheduleNext(5000);
+      return;
+    }
 
     busy = true;
     queryMainProcs().then(async (procs) => {
+      let nextDelay = computeNextDelay(procs);
       try {
         if (procs.some((p) => p.hasCdp)) {
           if (readPort(portFile) > 0 && attachedTargets.size === 0) {
@@ -524,12 +674,30 @@ function startMacCdpBootstrap() {
           return;
         }
 
+        /* Do not kill newly spawned child/helper processes when an established non-CDP main instance (>35s) already exists */
+        if (procs.some((p) => !p.hasCdp && p.age > 35)) {
+          nextDelay = 10000;
+          return;
+        }
+
         const candidate = procs.find((p) => !p.hasCdp && !attemptedPids.has(p.pid) && p.age <= 35);
         if (!candidate) return;
+        /* Avoid killing a process with custom profile/user-data-dir or ambiguous unquoted CLI path args */
+        if (candidate.hasCustomProfile || candidate.hasAmbiguousArgs) {
+          attemptedPids.set(candidate.pid, Date.now());
+          console.log(`[Anti-Claude Daemon] Skipping auto-relaunch for PID ${candidate.pid} (custom launch arguments detected)`);
+          return;
+        }
+        /* Let age=0 processes finish initial startup config writes before sending SIGTERM */
+        if (candidate.age < 1) {
+          nextDelay = 900;
+          return;
+        }
         if (candidate.age > 15 && hasRecentConversationWalActivity(convDir, 8000)) return;
 
         const targetPid = candidate.pid;
         const appBundle = candidate.appBundle || candidateApps.find((p) => fs.existsSync(p)) || candidateApps[0];
+        const extraArgs = Array.isArray(candidate.extraArgs) ? candidate.extraArgs : [];
         const startTs = Date.now();
         lastAttemptAt = startTs;
         attemptedPids.set(targetPid, startTs);
@@ -538,51 +706,84 @@ function startMacCdpBootstrap() {
           `[Anti-Claude Daemon] Relaunching fresh Antigravity (PID ${targetPid}, age=${candidate.age}s) with --remote-debugging-port=0`
         );
 
-        try {
-          process.kill(targetPid, 'SIGTERM');
-        } catch {
-          return;
-        }
+        const doRelaunch = async () => {
+          try {
+            writeAtomicUtf8(
+              RELAUNCH_INTENT_FILE,
+              `${JSON.stringify({ targetPid, appBundle, extraArgs, startedAt: Date.now() })}\n`
+            );
+          } catch {}
 
-        const outcome = await waitForMacRelaunchReady({
-          targetPid,
-          isProcessAlive: (pid) => {
+          try {
+            process.kill(targetPid, 'SIGTERM');
+          } catch {
+            clearRelaunchIntent();
+            return;
+          }
+
+          const isPidAlive = (pid) => {
             try {
               process.kill(pid, 0);
               return true;
             } catch {
               return false;
             }
-          },
-          listMainProcs: queryMainProcs,
-          hasLock: hasSingletonLock,
-          tryClearStaleLock: tryClearStaleSingletonLock,
-          onReadyToOpen: () =>
-            new Promise((resolve) => {
-              try {
-                fs.rmSync(portFile, { force: true });
-              } catch {}
-              execFile(
-                '/usr/bin/open',
-                ['-n', '-a', appBundle, '--args', '--remote-debugging-port=0'],
-                () => {
-                  waitPortAndSync(40);
-                  resolve();
+          };
+
+          let outcome = await waitForMacRelaunchReady({
+            targetPid,
+            isProcessAlive: isPidAlive,
+            listMainProcs: queryMainProcs,
+            hasLock: hasSingletonLock,
+            tryClearStaleLock: tryClearStaleSingletonLock,
+            onReadyToOpen: () => openAppWithRetry(appBundle, extraArgs)
+          });
+
+          if (!outcome.relaunched && outcome.reason === 'exit_timeout') {
+            /* Grace re-check in case SIGTERM completed right after timeout */
+            await new Promise((r) => setTimeout(r, 1500));
+            if (!isPidAlive(targetPid)) {
+              const lingering = await queryMainProcs();
+              if (lingering.length === 0) {
+                if (hasSingletonLock()) tryClearStaleSingletonLock(targetPid);
+                if (!hasSingletonLock()) {
+                  await openAppWithRetry(appBundle, extraArgs);
+                  outcome = { relaunched: true, lateExitRecovered: true };
                 }
-              );
-            })
+              }
+            }
+          } else if (!outcome.relaunched && outcome.reason === 'singleton_lock_held') {
+            await new Promise((r) => setTimeout(r, 1500));
+            const lingering = await queryMainProcs();
+            if (lingering.length === 0 && tryClearStaleSingletonLock(targetPid) && !hasSingletonLock()) {
+              await openAppWithRetry(appBundle, extraArgs);
+              outcome = { relaunched: true, staleLockCleared: true };
+            }
+          }
+
+          clearRelaunchIntent();
+          if (!outcome.relaunched) {
+            console.warn(
+              `[Anti-Claude Daemon] Relaunch did not complete for PID ${targetPid} (reason=${outcome.reason || 'unknown'})`
+            );
+          }
+        };
+
+        activeRelaunchPromise = doRelaunch().finally(() => {
+          activeRelaunchPromise = null;
         });
-        if (!outcome.relaunched && outcome.reason === 'exit_timeout') {
-          console.warn(`[Anti-Claude Daemon] PID ${targetPid} did not exit within 8s; skipping relaunch`);
-        }
+        await activeRelaunchPromise;
+        nextDelay = 1200;
       } finally {
         busy = false;
+        scheduleNext(nextDelay);
       }
     });
   };
 
-  setInterval(checkFreshLaunch, 650).unref();
-  checkFreshLaunch();
+  recoverInterruptedRelaunch()
+    .catch(() => {})
+    .finally(() => checkFreshLaunch());
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1278,44 +1479,131 @@ function parseConversationMetrics(cascadeId, conversationsDir) {
 
 const PROJECTS_REGISTRY_FILE = path.join(STATE_DIR, 'projects-registry.json');
 
-function isSafeProjectDir(absDir) {
-  if (!absDir || !path.isAbsolute(absDir)) return false;
-  if (path.dirname(absDir) === absDir) return false; // filesystem root
+const CASE_INSENSITIVE_FS = process.platform === 'darwin' || process.platform === 'win32';
+
+function normalizePathForCompare(p) {
+  const resolved = path.resolve(String(p || ''));
+  return CASE_INSENSITIVE_FS ? resolved.toLowerCase() : resolved;
+}
+
+function resolveRealPathBestEffort(absPath) {
+  const resolved = path.resolve(String(absPath || ''));
+  try {
+    return fs.realpathSync(resolved);
+  } catch {}
+  /* Walk up until an existing ancestor is found, then join the remaining suffix */
+  const suffix = [];
+  let cur = resolved;
+  while (cur && cur !== path.dirname(cur)) {
+    try {
+      const realBase = fs.realpathSync(cur);
+      return suffix.length ? path.join(realBase, ...suffix.reverse()) : realBase;
+    } catch {}
+    suffix.push(path.basename(cur));
+    cur = path.dirname(cur);
+  }
+  return resolved;
+}
+
+function getBlockedSystemPrefixes() {
   const resolvedHome = path.resolve(HOME);
-  if (absDir === resolvedHome) return false;
-  const blockedPrefixes = [
-    path.join(resolvedHome, '.ssh'),
-    path.join(resolvedHome, '.gnupg'),
-    path.join(resolvedHome, '.aws'),
+  const realHome = resolveRealPathBestEffort(resolvedHome);
+  const homes = resolvedHome === realHome ? [resolvedHome] : [resolvedHome, realHome];
+  const prefixes = [
     STATE_DIR,
+    resolveRealPathBestEffort(STATE_DIR),
     GLOBAL_SKILLS_DIR,
+    resolveRealPathBestEffort(GLOBAL_SKILLS_DIR),
     GLOBAL_AGENTS_DIR,
+    resolveRealPathBestEffort(GLOBAL_AGENTS_DIR),
     SIDECARS_DIR,
+    resolveRealPathBestEffort(SIDECARS_DIR),
     '/System',
     '/bin',
     '/sbin',
     '/usr',
     '/etc',
     '/private/etc',
+    '/private/var/db',
     'C:\\Windows',
-    'C:\\Program Files'
+    'C:\\Program Files',
+    'C:\\Program Files (x86)'
   ];
-  for (const blocked of blockedPrefixes) {
-    if (absDir === blocked || isPathInsideDir(blocked, absDir)) return false;
+  for (const h of homes) {
+    prefixes.push(
+      path.join(h, '.ssh'),
+      path.join(h, '.gnupg'),
+      path.join(h, '.aws'),
+      path.join(h, '.kube'),
+      path.join(h, '.config', 'gcloud'),
+      path.join(h, 'Library', 'Keychains')
+    );
+  }
+  return prefixes;
+}
+
+export function isSensitiveSourcePath(absPath) {
+  if (!absPath || !path.isAbsolute(absPath)) return true;
+  const candidates = [path.resolve(absPath), resolveRealPathBestEffort(absPath)];
+  const blockedPrefixes = getBlockedSystemPrefixes();
+  for (const cand of candidates) {
+    const normCand = normalizePathForCompare(cand);
+    for (const blocked of blockedPrefixes) {
+      const normBlocked = normalizePathForCompare(blocked);
+      if (normCand === normBlocked || isPathInsideDir(normBlocked, normCand)) return true;
+    }
+    /* Block common credential/key files directly under HOME */
+    const base = path.basename(cand).toLowerCase();
+    if (
+      base === '.netrc' ||
+      base === '.npmrc' ||
+      base === '.pypirc' ||
+      base === '.git-credentials' ||
+      base === 'id_rsa' ||
+      base === 'id_ed25519' ||
+      base === 'id_ecdsa'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isSafeProjectDir(absDir) {
+  if (!absDir || !path.isAbsolute(absDir)) return false;
+  const resolved = path.resolve(absDir);
+  if (path.dirname(resolved) === resolved) return false; // filesystem root
+  const realResolved = resolveRealPathBestEffort(resolved);
+  if (path.dirname(realResolved) === realResolved) return false;
+
+  const normHome = normalizePathForCompare(HOME);
+  const normRealHome = normalizePathForCompare(resolveRealPathBestEffort(HOME));
+  for (const cand of [resolved, realResolved]) {
+    const normCand = normalizePathForCompare(cand);
+    if (normCand === normHome || normCand === normRealHome) return false;
+  }
+  const blockedPrefixes = getBlockedSystemPrefixes();
+  for (const cand of [resolved, realResolved]) {
+    const normCand = normalizePathForCompare(cand);
+    for (const blocked of blockedPrefixes) {
+      const normBlocked = normalizePathForCompare(blocked);
+      if (normCand === normBlocked || isPathInsideDir(normBlocked, normCand)) return false;
+    }
   }
   return true;
 }
 
-function recordManagedProjectDir(dirPath, active = true) {
+function recordManagedProjectDir(dirPath, active = true, registryFile = PROJECTS_REGISTRY_FILE) {
+  if (!registryFile) return;
   try {
-    const cur = readJsonOrFallback(PROJECTS_REGISTRY_FILE, null);
+    const cur = readJsonOrFallback(registryFile, null);
     const list = new Set(Array.isArray(cur?.dirs) ? cur.dirs : []);
     if (active) list.add(dirPath);
     else list.delete(dirPath);
     if (list.size > 0) {
-      writeAtomicUtf8(PROJECTS_REGISTRY_FILE, `${JSON.stringify({ schema: 1, dirs: [...list] }, null, 2)}\n`);
-    } else if (fs.existsSync(PROJECTS_REGISTRY_FILE)) {
-      fs.rmSync(PROJECTS_REGISTRY_FILE, { force: true });
+      writeAtomicUtf8(registryFile, `${JSON.stringify({ schema: 1, dirs: [...list] }, null, 2)}\n`);
+    } else if (fs.existsSync(registryFile)) {
+      fs.rmSync(registryFile, { force: true });
     }
   } catch {}
 }
@@ -1349,7 +1637,7 @@ function resolveLocalProjectDir(rawDir) {
 }
 
 function isPathInsideDir(parentDir, targetPath) {
-  const rel = path.relative(parentDir, targetPath);
+  const rel = path.relative(normalizePathForCompare(parentDir), normalizePathForCompare(targetPath));
   return Boolean(rel && !rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
@@ -1360,11 +1648,43 @@ function formatHumanBytes(bytes) {
   return `${n} B`;
 }
 
+function resolveAtomicWriteTarget(filePath) {
+  try {
+    const lst = fs.lstatSync(filePath);
+    if (lst.isSymbolicLink()) {
+      try {
+        return fs.realpathSync(filePath);
+      } catch {
+        return path.resolve(path.dirname(filePath), fs.readlinkSync(filePath));
+      }
+    }
+  } catch {}
+  return filePath;
+}
+
 function writeAtomicUtf8(filePath, content) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, content, 'utf8');
-  fs.renameSync(tmp, filePath);
+  const target = resolveAtomicWriteTarget(filePath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let prevMode = null;
+  try {
+    const st = fs.statSync(target, { throwIfNoEntry: false });
+    if (st && st.isFile()) prevMode = st.mode & 0o777;
+  } catch {}
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    fs.writeFileSync(tmp, content, prevMode !== null ? { encoding: 'utf8', mode: prevMode } : 'utf8');
+    if (prevMode !== null) {
+      try {
+        fs.chmodSync(tmp, prevMode);
+      } catch {}
+    }
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
 }
 
 function isInlineCandidate(fileName, sizeBytes) {
@@ -1534,7 +1854,7 @@ function uniqueDestPath(destDir, rawBaseName) {
   return candidate;
 }
 
-export function saveProjectContext(payload) {
+export function saveProjectContext(payload, { registryFile = PROJECTS_REGISTRY_FILE } = {}) {
   const dirPath = resolveLocalProjectDir(payload?.dirPath);
   if (!dirPath) return { ok: false, error: 'invalid_directory' };
 
@@ -1575,14 +1895,17 @@ export function saveProjectContext(payload) {
       nextFiles.push({ name: op.name || path.basename(absPath), relPath: relNorm, size: st.size, managedCopy });
     } else if (op.action === 'add' && typeof op.sourcePath === 'string') {
       const srcAbs = path.resolve(op.sourcePath.trim());
+      if (isSensitiveSourcePath(srcAbs)) continue;
       const st = fs.statSync(srcAbs, { throwIfNoEntry: false });
       if (!st || !st.isFile()) continue;
+      const realSrc = resolveRealPathBestEffort(srcAbs);
+      if (isSensitiveSourcePath(realSrc)) continue;
       let finalAbs = srcAbs;
       let managedCopy = false;
-      if (!isPathInsideDir(dirPath, srcAbs)) {
+      if (!isPathInsideDir(dirPath, realSrc)) {
         fs.mkdirSync(filesDir, { recursive: true });
         finalAbs = uniqueDestPath(filesDir, path.basename(srcAbs));
-        fs.copyFileSync(srcAbs, finalAbs);
+        fs.copyFileSync(realSrc, finalAbs);
         try {
           fs.chmodSync(finalAbs, 0o644);
         } catch {}
@@ -1697,7 +2020,7 @@ export function saveProjectContext(payload) {
         2
       )}\n`
     );
-    recordManagedProjectDir(dirPath, true);
+    recordManagedProjectDir(dirPath, true, registryFile);
   } else {
     try {
       fs.rmSync(metaPath, { force: true });
@@ -1705,7 +2028,7 @@ export function saveProjectContext(payload) {
       const acDir = path.join(dirPath, '.anti-claude');
       if (fs.existsSync(acDir) && fs.readdirSync(acDir).length === 0) fs.rmdirSync(acDir);
     } catch {}
-    recordManagedProjectDir(dirPath, false);
+    recordManagedProjectDir(dirPath, false, registryFile);
   }
 
   return readProjectContext(dirPath);
@@ -1820,10 +2143,19 @@ function readProjectScheduledTasks(dirPath, rawMeta, extraFolders = []) {
 
   for (const t of stored) {
     if (!t || typeof t !== 'object' || !t.name) continue;
-    const sidecarId = typeof t.sidecarId === 'string' ? t.sidecarId.trim() : '';
-    if (sidecarId) knownSidecarIds.add(sidecarId);
-    const sidecarPath = sidecarId ? path.join(SIDECARS_DIR, sidecarId, 'sidecar.json') : '';
-    const syncedSidecar = Boolean(sidecarId && fs.existsSync(sidecarPath));
+    const rawSidecarId = typeof t.sidecarId === 'string' ? t.sidecarId.trim() : '';
+    let sidecarId = '';
+    let syncedSidecar = false;
+    if (rawSidecarId && /^[a-z0-9._-]+$/i.test(rawSidecarId)) {
+      const sidecarPath = path.join(SIDECARS_DIR, rawSidecarId, 'sidecar.json');
+      const sc = isPathInsideDir(SIDECARS_DIR, sidecarPath) ? readJsonOrFallback(sidecarPath, null) : null;
+      /* Verify sidecar ownership against trusted local sidecar metadata — never blindly trust cloned repo JSON */
+      if (sc && sidecarBelongsToProject(sc, rawSidecarId, projectDirs, path.resolve(dirPath))) {
+        sidecarId = rawSidecarId;
+        syncedSidecar = true;
+        knownSidecarIds.add(sidecarId);
+      }
+    }
     tasks.push({
       id: String(t.id || sidecarId || `task-${tasks.length + 1}`),
       name: String(t.name),
@@ -1901,16 +2233,25 @@ function buildProjectDirSet(dirPath, prevMeta) {
   return dirs;
 }
 
-function sidecarBelongsToProject(sc, sidecarId, prevTasks, projectDirs, dirPath) {
-  if (Array.isArray(prevTasks) && prevTasks.some((t) => t && t.sidecarId === sidecarId)) return true;
+function sidecarBelongsToProject(sc, sidecarId, projectDirs, dirPath) {
   if (!sc || typeof sc !== 'object') return false;
-  if (sc.anti_claude_project_dir && path.resolve(sc.anti_claude_project_dir) === dirPath) return true;
+  const normDirs = new Set([...projectDirs].map((d) => normalizePathForCompare(resolveRealPathBestEffort(d))));
+  normDirs.add(normalizePathForCompare(resolveRealPathBestEffort(dirPath)));
+  if (sc.anti_claude_project_dir) {
+    const scDir = normalizePathForCompare(resolveRealPathBestEffort(path.resolve(sc.anti_claude_project_dir)));
+    if (normDirs.has(scDir)) return true;
+  }
   if (sc.builtin !== 'schedule') return false;
   const uris = Array.isArray(sc.agent_permissions?.workspace_uris) ? sc.agent_permissions.workspace_uris : [];
-  return uris.map(fromFileUriSafe).some((p) => p && projectDirs.has(p));
+  return uris
+    .map(fromFileUriSafe)
+    .some((p) => p && normDirs.has(normalizePathForCompare(resolveRealPathBestEffort(p))));
 }
 
-export function saveProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR } = {}) {
+export function saveProjectScheduledTask(
+  payload,
+  { sidecarsDir = SIDECARS_DIR, registryFile = sidecarsDir === SIDECARS_DIR ? PROJECTS_REGISTRY_FILE : null } = {}
+) {
   const dirPath = resolveLocalProjectDir(payload?.dirPath);
   if (!dirPath) return { ok: false, error: 'invalid_directory' };
   const rawTask = payload?.task;
@@ -1951,7 +2292,7 @@ export function saveProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR }
       const scDir = path.join(sidecarsDir, sidecarId);
       if (isPathInsideDir(sidecarsDir, scDir) && fs.existsSync(scDir)) {
         const existingSc = readJsonOrFallback(path.join(scDir, 'sidecar.json'), null);
-        if (!sidecarBelongsToProject(existingSc, sidecarId, prevTasks, projectDirs, dirPath)) {
+        if (!sidecarBelongsToProject(existingSc, sidecarId, projectDirs, dirPath)) {
           return { ok: false, error: 'sidecar_not_in_project' };
         }
         try {
@@ -1967,7 +2308,7 @@ export function saveProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR }
     const scDir = path.join(sidecarsDir, sidecarId);
     if (!isPathInsideDir(sidecarsDir, scDir)) return { ok: false, error: 'invalid_sidecar_id' };
     const existingSc = readJsonOrFallback(path.join(scDir, 'sidecar.json'), null);
-    if (existingSc && !sidecarBelongsToProject(existingSc, sidecarId, prevTasks, projectDirs, dirPath)) {
+    if (existingSc && !sidecarBelongsToProject(existingSc, sidecarId, projectDirs, dirPath)) {
       return { ok: false, error: 'sidecar_not_in_project' };
     }
     const args = [cron, 'agentapi', 'new-conversation'];
@@ -2055,13 +2396,16 @@ export function saveProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR }
       2
     )}\n`
   );
-  recordManagedProjectDir(dirPath, true);
+  recordManagedProjectDir(dirPath, true, registryFile);
 
   const ctx = readProjectContext(dirPath);
   return { ...ctx, savedTaskId: savedId, sidecarId };
 }
 
-export function deleteProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR } = {}) {
+export function deleteProjectScheduledTask(
+  payload,
+  { sidecarsDir = SIDECARS_DIR, registryFile = sidecarsDir === SIDECARS_DIR ? PROJECTS_REGISTRY_FILE : null } = {}
+) {
   const dirPath = resolveLocalProjectDir(payload?.dirPath);
   if (!dirPath) return { ok: false, error: 'invalid_directory' };
   const taskId = String(payload?.taskId || '').trim();
@@ -2082,7 +2426,7 @@ export function deleteProjectScheduledTask(payload, { sidecarsDir = SIDECARS_DIR
     if (!isPathInsideDir(sidecarsDir, scDir)) return { ok: false, error: 'invalid_sidecar_id' };
     if (fs.existsSync(scDir)) {
       const existingSc = readJsonOrFallback(path.join(scDir, 'sidecar.json'), null);
-      if (!sidecarBelongsToProject(existingSc, sidecarId, prevTasks, projectDirs, dirPath)) {
+      if (!sidecarBelongsToProject(existingSc, sidecarId, projectDirs, dirPath)) {
         return { ok: false, error: 'sidecar_not_in_project' };
       }
       try {
@@ -2539,12 +2883,25 @@ function getOriginKey(rawUrl) {
 
 async function fetchTargets(port) {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
-    if (!res.ok) return [];
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return { ok: false, targets: [] };
     const list = await res.json();
-    return Array.isArray(list) ? list : [];
+    return { ok: true, targets: Array.isArray(list) ? list : [] };
   } catch {
-    return [];
+    return { ok: false, targets: [] };
+  }
+}
+
+async function isAntigravityFallbackPort(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1200) });
+    if (!res.ok) return false;
+    const info = await res.json();
+    const ua = String(info?.['User-Agent'] || '');
+    const browser = String(info?.Browser || '');
+    return /\bAntigravity\b|\bElectron\//i.test(`${ua} ${browser}`);
+  } catch {
+    return false;
   }
 }
 
@@ -2553,12 +2910,25 @@ export const HOST_IDENTITY_PROBE_EXPR = `(function () {
   if (loc.protocol === 'plugin:' && /^swarm--/i.test(loc.hostname || '')) return 'swarm';
   if (/^plugin:\\/\\/swarm--/i.test(loc.href || '')) return 'swarm';
   if (loc.protocol === 'vscode-file:') return 'host';
-  var isElectronHost = /\\bElectron\\//i.test((typeof navigator !== 'undefined' && navigator.userAgent) || '') ||
-    Boolean(typeof window !== 'undefined' && window.electronNative && typeof window.electronNative.getZoomLevel === 'function');
+  if (loc.protocol === 'file:' && /\\/Antigravity\\.app\\/|\\/antigravity\\/resources\\//i.test(loc.href || '')) return 'host';
+  var ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  var isElectronHost = /\\bElectron\\//i.test(ua);
   if (!isElectronHost) return 'non_host';
-  if (window.electronNative && (typeof window.electronNative.getZoomLevel === 'function' || typeof window.electronNative.setTitleBarOverlay === 'function')) return 'host';
-  if (window.__APP_CONFIG__ && window.__APP_CONFIG__.productName === 'antigravity') return 'host';
-  if (document.querySelector && document.querySelector('link[href*="/jetbox.css"], body[data-agy-theme], body[data-newux-theme], [id="antigravity.agentSidePanelInputBox"]')) return 'host';
+  /* Require the genuine non-configurable, frozen contextBridge preload object rather than page-forgeable DOM or globals */
+  var en = typeof window !== 'undefined' ? window.electronNative : null;
+  if (en && typeof en === 'object' && Object.isFrozen(en)) {
+    var desc = Object.getOwnPropertyDescriptor(window, 'electronNative');
+    var lockedOnWindow = Boolean(desc && desc.configurable === false && desc.writable === false);
+    var isNativeFn = function (fn) {
+      if (typeof fn !== 'function') return false;
+      var name = String(fn.name || '');
+      if (name.indexOf('bound ') === 0) return false;
+      try { return Function.prototype.toString.call(fn).indexOf('[native code]') !== -1; } catch (_) { return false; }
+    };
+    if (lockedOnWindow && isNativeFn(en.getZoomLevel) && isNativeFn(en.setTitleBarOverlay) && isNativeFn(en.openExternal)) {
+      return 'host';
+    }
+  }
   if (document.readyState === 'loading') return 'loading';
   return 'non_host';
 })()`;
@@ -2783,6 +3153,17 @@ export async function attachTarget(page, endpoint, opts = {}) {
     }
   };
 
+  const bindHostBindings = async () => {
+    if (page.type !== 'page') return;
+    const bindParams = (name) =>
+      entry.trustedContextId !== null ? { name, executionContextId: entry.trustedContextId } : { name };
+    for (const name of ['__agRequestMetrics', '__agSyncHostThemeMode', '__agProjectRpc']) {
+      await send('Runtime.addBinding', bindParams(name)).catch(() =>
+        send('Runtime.addBinding', { name }).catch(() => {})
+      );
+    }
+  };
+
   entry.reverifyAfterNavigation = async (gen) => {
     if (closed || gen !== entry.navGen) return;
     if (!isAllowedOrigin(entry.url)) {
@@ -2812,9 +3193,7 @@ export async function attachTarget(page, endpoint, opts = {}) {
     if (readOnly) return;
     entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
     entry.rpcSessionId = page.type === 'page' ? crypto.randomBytes(12).toString('hex') : '';
-    if (page.type === 'page' && entry.trustedContextId !== null) {
-      await send('Runtime.addBinding', { name: '__agProjectRpc', executionContextId: entry.trustedContextId }).catch(() => {});
-    }
+    await bindHostBindings();
     await entry.injectNow();
     await entry.syncMetricsForSession(true);
   };
@@ -2934,8 +3313,13 @@ export async function attachTarget(page, endpoint, opts = {}) {
 
   ws.addEventListener('close', () => {
     failAll('ws_closed');
-    attachedTargets.delete(page.id);
-    targetThemeModes.delete(page.id);
+    if (attachedTargets.get(page.id) === entry) {
+      attachedTargets.delete(page.id);
+      targetThemeModes.delete(page.id);
+      if (attachedTargets.size === 0 && typeof wakeMacBootstrap === 'function') {
+        wakeMacBootstrap();
+      }
+    }
   });
   ws.addEventListener('error', () => failAll('ws_error'));
 
@@ -2984,25 +3368,16 @@ export async function attachTarget(page, endpoint, opts = {}) {
     entry.rpcToken = page.type === 'page' ? crypto.randomBytes(24).toString('hex') : '';
     entry.rpcSessionId = page.type === 'page' ? crypto.randomBytes(12).toString('hex') : '';
 
-    if (page.type === 'page') {
-      const bindParams = (name) =>
-        entry.trustedContextId !== null ? { name, executionContextId: entry.trustedContextId } : { name };
-      await send('Runtime.addBinding', bindParams('__agRequestMetrics')).catch(() =>
-        send('Runtime.addBinding', { name: '__agRequestMetrics' }).catch(() => {})
-      );
-      await send('Runtime.addBinding', bindParams('__agSyncHostThemeMode')).catch(() =>
-        send('Runtime.addBinding', { name: '__agSyncHostThemeMode' }).catch(() => {})
-      );
-      await send('Runtime.addBinding', bindParams('__agProjectRpc')).catch(() =>
-        send('Runtime.addBinding', { name: '__agProjectRpc' }).catch(() => {})
-      );
-    }
+    await bindHostBindings();
 
     await entry.updateNewDocScript();
     await entry.injectNow();
     await entry.syncMetricsForSession(true);
   } catch {
-    attachedTargets.delete(page.id);
+    if (attachedTargets.get(page.id) === entry) {
+      attachedTargets.delete(page.id);
+      targetThemeModes.delete(page.id);
+    }
     try {
       ws.close();
     } catch {}
@@ -3016,6 +3391,7 @@ export async function attachTarget(page, endpoint, opts = {}) {
 let isSyncing = false;
 let syncTickCount = 0;
 let lastReachablePort = 0;
+const endpointConsecutiveFailures = new Map();
 
 async function sync(opts = {}) {
   const readOnly = Boolean(opts && opts.readOnly);
@@ -3030,6 +3406,7 @@ async function sync(opts = {}) {
 
     const activeTargetIds = new Set();
     const seenRawTargetIds = new Set();
+    const authoritativeChannels = new Set();
     const pendingPages = [];
     const pendingIframes = [];
     const probedPorts = new Set();
@@ -3038,11 +3415,16 @@ async function sync(opts = {}) {
     for (const endpoint of activeConfig.endpoints) {
       const port = readPort(endpoint.portFile);
       let targets = [];
+      let querySucceeded = false;
       let usedPort = 0;
       if (port && !probedPorts.has(port)) {
         probedPorts.add(port);
-        targets = await fetchTargets(port);
-        if (targets.length > 0) usedPort = port;
+        const res = await fetchTargets(port);
+        if (res.ok) {
+          querySucceeded = true;
+          targets = res.targets;
+          if (targets.length > 0) usedPort = port;
+        }
       }
       if (
         targets.length === 0 &&
@@ -3051,13 +3433,26 @@ async function sync(opts = {}) {
         (RUN_ONCE || nowMs >= (fallbackBackoffUntil.get(endpoint.fallbackPort) || 0))
       ) {
         probedPorts.add(endpoint.fallbackPort);
-        targets = await fetchTargets(endpoint.fallbackPort);
+        const isAgPort = await isAntigravityFallbackPort(endpoint.fallbackPort);
+        if (isAgPort) {
+          const res = await fetchTargets(endpoint.fallbackPort);
+          if (res.ok) {
+            querySucceeded = true;
+            targets = res.targets;
+          }
+        }
         if (targets.length === 0) {
           fallbackBackoffUntil.set(endpoint.fallbackPort, nowMs + 10000);
         } else {
           fallbackBackoffUntil.delete(endpoint.fallbackPort);
           usedPort = endpoint.fallbackPort;
         }
+      }
+      if (querySucceeded) {
+        endpointConsecutiveFailures.delete(endpoint.channel);
+        authoritativeChannels.add(endpoint.channel);
+      } else {
+        endpointConsecutiveFailures.set(endpoint.channel, (endpointConsecutiveFailures.get(endpoint.channel) || 0) + 1);
       }
       if (targets.length === 0) continue;
       lastReachablePort = usedPort;
@@ -3117,10 +3512,18 @@ async function sync(opts = {}) {
     await syncBatch(pendingIframes);
 
     for (const [id, entry] of attachedTargets.entries()) {
-      if (!activeTargetIds.has(id)) {
-        try {
-          entry.ws.close();
-        } catch {}
+      if (activeTargetIds.has(id)) continue;
+      const ch = entry.endpoint?.channel;
+      const wsDead = entry.ws?.readyState !== WebSocket.OPEN;
+      const fails = ch ? endpointConsecutiveFailures.get(ch) || 0 : 0;
+      /* Do not drop live WebSocket targets on a single transient /json/list timeout */
+      if (!wsDead && ch && !authoritativeChannels.has(ch) && fails < 3) {
+        continue;
+      }
+      try {
+        entry.ws.close();
+      } catch {}
+      if (attachedTargets.get(id) === entry) {
         attachedTargets.delete(id);
         targetThemeModes.delete(id);
       }

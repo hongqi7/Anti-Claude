@@ -89,12 +89,15 @@ test('[Audit #1 & #9-R2] partial saveProjectContext updates instructions without
   fs.writeFileSync(path.join(projDir, 'AGENTS.md'), '# Existing Project Rules\nKeep me intact.\n');
 
   try {
-    const initial = daemon.saveProjectContext({
-      dirPath: projDir,
-      instructions: 'Initial instructions',
-      files: [{ action: 'add', sourcePath: extSrc, name: 'spec.md' }],
-      extraFolders: [{ name: 'linked-lib', absPath: linkedDir }]
-    });
+    const initial = daemon.saveProjectContext(
+      {
+        dirPath: projDir,
+        instructions: 'Initial instructions',
+        files: [{ action: 'add', sourcePath: extSrc, name: 'spec.md' }],
+        extraFolders: [{ name: 'linked-lib', absPath: linkedDir }]
+      },
+      { registryFile: null }
+    );
     assert.equal(initial.ok, true);
     assert.equal(initial.files.length, 1);
     assert.equal(initial.extraFolders.length, 1);
@@ -102,10 +105,13 @@ test('[Audit #1 & #9-R2] partial saveProjectContext updates instructions without
     assert.equal(fs.existsSync(managedPath), true, 'managed attachment copy created');
 
     /* Partial update with ONLY `instructions` (omitting `files` and `extraFolders`) must preserve both */
-    const afterInstOnly = daemon.saveProjectContext({
-      dirPath: projDir,
-      instructions: 'Updated instructions only'
-    });
+    const afterInstOnly = daemon.saveProjectContext(
+      {
+        dirPath: projDir,
+        instructions: 'Updated instructions only'
+      },
+      { registryFile: null }
+    );
     assert.equal(afterInstOnly.ok, true);
     assert.equal(afterInstOnly.instructions, 'Updated instructions only');
     assert.equal(afterInstOnly.files.length, 1, 'attachment preserved on instructions-only save');
@@ -113,12 +119,15 @@ test('[Audit #1 & #9-R2] partial saveProjectContext updates instructions without
     assert.equal(fs.existsSync(managedPath), true, 'managed copy on disk still exists');
 
     /* Clearing all project context removes managed block AND the `---` divider without leaving frontmatter residue */
-    const cleared = daemon.saveProjectContext({
-      dirPath: projDir,
-      instructions: '',
-      files: [],
-      extraFolders: []
-    });
+    const cleared = daemon.saveProjectContext(
+      {
+        dirPath: projDir,
+        instructions: '',
+        files: [],
+        extraFolders: []
+      },
+      { registryFile: null }
+    );
     assert.equal(cleared.ok, true);
     assert.equal(cleared.files.length, 0);
     assert.equal(fs.existsSync(managedPath), false, 'explicit empty files array removes managed copy');
@@ -1057,7 +1066,7 @@ test('[v2.33 New Project] clicking New project bypasses sidebar multi-item popov
     view.querySelector('[data-ag-proj-new]').click();
     assert.deepEqual(
       dispatched.map((a) => a.type),
-      ['newProject/reset', 'newProject/setCurrentStep', 'newProject/setIsOpen'],
+      ['newProject/reset', 'newProject/setStep', 'newProject/setIsOpen'],
       'dispatches native newProject Redux actions when sidebar button is virtualized out of DOM'
     );
     assert.equal(state.newProject.isOpen, true);
@@ -2689,6 +2698,872 @@ test('[Scheduled Task Dynamic Models] populates account models & all effort tier
     assert.ok(
       dispatched.some((a) => a && a.type === 'modelSelection/modelPicked' && a.payload && a.payload.model === 1535),
       'Run Now syncs selected task model before starting conversation'
+    );
+  } finally {
+    window.close();
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* Native pass-through: official features must never be masked by this layer   */
+/* -------------------------------------------------------------------------- */
+
+function mountModelMenuDom(apiValue, { triggerText = 'Claude Opus 5.5 · Devin High' } = {}) {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body><div id="root">
+      <button type="button" data-testid="model-selector-trigger">${triggerText}</button>
+    </div></body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-native', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const btn = window.document.querySelector('button[data-testid="model-selector-trigger"]');
+  btn.getBoundingClientRect = () => ({ left: 40, top: 760, right: 240, bottom: 788, width: 200, height: 28 });
+  btn.__reactFiber$native = { memoizedProps: { value: apiValue }, return: null };
+  window.ctx = { modules: { i18n: false, claudeUxModelMenu: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+  const fire = (type, init = {}) => {
+    const ev = new window.MouseEvent(type, { bubbles: true, cancelable: true, button: 0, ...init });
+    btn.dispatchEvent(ev);
+    return ev;
+  };
+  return { window, doc: window.document, btn, fire };
+}
+
+function thirdPartyOnlyApi(extra = {}) {
+  const modelOptions = [
+    { label: 'Claude Opus 5.5 · Devin (Medium)', value: 1356, modelId: 'devin/claude-opus-5-5:medium', disabled: false },
+    { label: 'Claude Fable 5.2 · Devin (Low)', value: 1349, modelId: 'devin/claude-fable-5-2:low', disabled: false },
+    { label: 'Claude Fable 5.2 · Devin (High)', value: 1344, modelId: 'devin/claude-fable-5-2:high', disabled: false },
+    { label: 'Claude Opus 5.5 · Devin (High)', value: 1359, modelId: 'devin/claude-opus-5-5:high', disabled: false }
+  ];
+  const state = { open: false, openCalls: [], selected: modelOptions[3] };
+  const api = {
+    placement: 'top-start',
+    modelOptions,
+    customModels: [],
+    orchestratorPlanners: [],
+    orchestratorPlannerIndex: {},
+    bestOfNConfig: { isBestOfNEnabled: false, selectedBestOfNModels: [] },
+    get selectedModel() {
+      return state.selected;
+    },
+    setSelectedModel(o) {
+      state.selected = o;
+    },
+    get open() {
+      return state.open;
+    },
+    setIsOpen(v) {
+      state.openCalls.push(v);
+      state.open = v;
+    },
+    ...extra
+  };
+  return { api, state };
+}
+
+test('[Native Pass-through · third-party-only account] primary model list is not empty when the account exposes no Gemini family', { skip: skipDom }, () => {
+  const { api } = thirdPartyOnlyApi();
+  const { window, doc, fire } = mountModelMenuDom(api);
+  try {
+    fire('pointerdown');
+    const mainPop = doc.getElementById('ag-claude-model-popover');
+    assert.equal(mainPop.getAttribute('data-open'), 'true');
+    assert.deepEqual(
+      Array.from(mainPop.querySelectorAll('[data-ag-cm-family]')).map((el) => el.getAttribute('data-ag-cm-family')),
+      ['Claude Opus 5.5 · Devin', 'Claude Fable 5.2 · Devin'],
+      'non-Gemini families fill "Models · This chat" in native order instead of leaving it empty'
+    );
+    assert.ok(
+      mainPop.querySelector('[data-ag-cm-family="Claude Opus 5.5 · Devin"] .ag-cm-check'),
+      'the selected third-party family is checked in the primary list'
+    );
+  } finally {
+    window.close();
+  }
+});
+
+test('[Native Pass-through · escape hatch] Native menu row and Option+click hand the trigger back to the official menu', { skip: skipDom }, async () => {
+  const { api, state } = thirdPartyOnlyApi();
+  const { window, doc, fire } = mountModelMenuDom(api);
+  try {
+    /* 1. Plain click is still taken over by the custom menu, which now carries a Native menu row */
+    const plain = fire('pointerdown');
+    assert.equal(plain.defaultPrevented, true);
+    const mainPop = doc.getElementById('ag-claude-model-popover');
+    const nativeRow = mainPop.querySelector('[data-ag-cm-native]');
+    assert.ok(nativeRow, 'custom menu exposes a Native menu row');
+    assert.equal(nativeRow.hasAttribute('data-ag-cm-native-gaps'), false, 'no hint dot when the native API has nothing extra');
+
+    /* 2. Clicking it closes the custom menu and opens the official one */
+    nativeRow.click();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(mainPop.getAttribute('data-open'), 'false');
+    assert.deepEqual(state.openCalls, [true], 'native setIsOpen(true) is called exactly once');
+
+    /* 3. Option/Alt + click is never intercepted (pointerdown, mousedown and click all pass through) */
+    state.open = false;
+    for (const type of ['pointerdown', 'mousedown', 'click']) {
+      const ev = fire(type, { altKey: true, detail: 1 });
+      assert.equal(ev.defaultPrevented, false, `${type} with Alt reaches the native trigger`);
+    }
+    assert.equal(mainPop.getAttribute('data-open'), 'false', 'custom menu stays closed on Alt+click');
+  } finally {
+    window.close();
+  }
+});
+
+test('[Native Pass-through · gap detection] unknown native fields flag the Native menu row; Best-of-N mode steps aside entirely', { skip: skipDom }, () => {
+  /* soft gap: a future release adds a field this menu does not know -> keep the menu, flag the row */
+  {
+    const { api } = thirdPartyOnlyApi({ someFutureFeature: { enabled: true } });
+    const { window, doc, fire } = mountModelMenuDom(api);
+    try {
+      fire('pointerdown');
+      const row = doc.querySelector('#ag-claude-model-popover [data-ag-cm-native]');
+      assert.match(row.getAttribute('data-ag-cm-native-gaps'), /new:someFutureFeature/);
+      assert.ok(row.querySelector('.ag-cm-dot'), 'hint dot is rendered');
+    } finally {
+      window.close();
+    }
+  }
+  /* known soft gap: the agent selector lives in the native footer (footerExtra) -> "More options", no drift dot */
+  {
+    const { api } = thirdPartyOnlyApi({ footerExtra: { type: 'AgentSelector' } });
+    const { window, doc, fire } = mountModelMenuDom(api);
+    try {
+      fire('pointerdown');
+      const row = doc.querySelector('#ag-claude-model-popover [data-ag-cm-native]');
+      assert.equal(row.getAttribute('data-ag-cm-native-gaps'), 'footerExtra');
+      assert.match(row.textContent, /More options/);
+      assert.equal(row.querySelector('.ag-cm-dot'), null, 'known gaps do not raise the release-drift dot');
+    } finally {
+      window.close();
+    }
+  }
+  /* hard gap: Best-of-N turns the native menu into a multi-select this menu cannot drive */
+  {
+    const { api } = thirdPartyOnlyApi({ bestOfNConfig: { isBestOfNEnabled: true, selectedBestOfNModels: [] } });
+    const { window, doc, fire } = mountModelMenuDom(api);
+    try {
+      const ev = fire('pointerdown');
+      assert.equal(ev.defaultPrevented, false, 'trigger click is left to the native menu');
+      const mainPop = doc.getElementById('ag-claude-model-popover');
+      assert.ok(!mainPop || mainPop.getAttribute('data-open') !== 'true', 'custom menu does not open');
+    } finally {
+      window.close();
+    }
+  }
+});
+
+test('[Native Pass-through · sidebar] Coordinators section above Pinned is never used as the hide cut-off', { skip: skipDom }, () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div class="bg-sidebar">
+        <div data-testid="conversation-list-sidebar">
+          <div class="w-full relative" style="height: 400px;">
+            <div data-index="0" style="position: sticky; top: 0px;"><div data-testid="section-header" data-title="Coordinators"><div data-testid="coordinator-section-header">协调者</div></div></div>
+            <div data-index="1" style="position: absolute; transform: translateY(24px);"><div data-testid="conversation-row-sidebar"><a href="/c/c-coord-1"></a></div></div>
+            <div data-index="2" style="position: absolute; transform: translateY(69px);"><div data-testid="section-header" data-title="Pinned"><div data-testid="pinned-section-header">置顶对话</div></div></div>
+            <div data-index="3" style="position: absolute; transform: translateY(93px);"><div data-testid="conversation-row-sidebar" data-pinned="true"><a href="/c/c-pin-1"></a></div></div>
+            <div data-index="4" style="position: absolute; transform: translateY(138px);"><div data-testid="section-header" data-title="Conversations">对话</div></div>
+            <div data-index="5" style="position: absolute; transform: translateY(162px);"><div data-testid="conversation-row-sidebar"><a href="/c/c-plain-1"></a></div></div>
+          </div>
+        </div>
+      </div>
+    </body></html>`,
+    { url: 'http://127.0.0.1/', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  window.ctx = { modules: { i18n: true, claudeUxHideSidebarProjects: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+  try {
+    const hidden = (i) => doc.querySelector(`[data-index="${i}"]`).getAttribute('data-ag-sb-hide-proj') === '1';
+    assert.deepEqual(
+      [0, 1, 2, 3, 4, 5].map(hidden),
+      [false, false, false, false, true, true],
+      'Coordinators + Pinned stay visible; only the native Conversations section is folded into Recents'
+    );
+  } finally {
+    window.close();
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* 2026-11-21 Comprehensive Audit Bug-Fix Regression Tests                    */
+/* -------------------------------------------------------------------------- */
+
+test('[Audit-2026-11-21 · Installer] preserves backup on corrupt state, respects statusLine on re-install, spares native ac-* sidecars, keeps symlink/mode, valid Win VBS', async () => {
+  const installer = await import(pathToFileURL(path.join(REPO, 'install.mjs')).href);
+
+  /* Bug #36: Windows VBS quoting for space + CJK username */
+  const vbs = installer.buildWinStartupVbs(
+    'C:\\Program Files\\nodejs\\node.exe',
+    'C:\\Users\\张三\\Anti-Claude\\core\\daemon.mjs',
+    'C:\\Users\\张三\\.gemini\\user'
+  );
+  assert.doesNotMatch(vbs, /""""/, 'VBS does not double-escape quotes into invalid quadruple quotes');
+  assert.match(vbs, /ChrW\(24352\)/, 'VBS encodes CJK characters with ChrW()');
+  assert.match(vbs, /sh\.Run "/, 'VBS emits clean WScript.Shell Run invocation');
+
+  const h = makeSandboxHome();
+  try {
+    /* Pre-existing user CSS and symlinked AGENTS.md with 0600 permissions */
+    const agyUserDir = path.join(h.home, '.gemini', 'antigravity', 'anti-claude', 'user');
+    fs.mkdirSync(agyUserDir, { recursive: true });
+    fs.writeFileSync(path.join(agyUserDir, 'custom.css'), '/* original user css */\n', 'utf8');
+
+    const realAgents = path.join(h.home, 'real-AGENTS.md');
+    fs.writeFileSync(realAgents, '# Personal Rules\n', { mode: 0o600 });
+    fs.chmodSync(realAgents, 0o600);
+    fs.rmSync(path.join(h.home, '.gemini', 'AGENTS.md'), { force: true });
+    fs.symlinkSync(realAgents, path.join(h.home, '.gemini', 'AGENTS.md'));
+
+    /* Official automation whose folder happens to start with ac- (no created_by: 'anti-claude') */
+    const nativeAcSidecar = path.join(h.home, '.gemini', 'config', 'sidecars', 'ac-official-report');
+    fs.mkdirSync(nativeAcSidecar, { recursive: true });
+    fs.writeFileSync(
+      path.join(nativeAcSidecar, 'sidecar.json'),
+      JSON.stringify({ builtin: 'schedule', display_name: 'Official AC Job', args: ['0 9 * * *'] })
+    );
+    const oursSidecar = path.join(h.home, '.gemini', 'config', 'sidecars', 'ac-ours-task');
+    fs.mkdirSync(oursSidecar, { recursive: true });
+    fs.writeFileSync(
+      path.join(oursSidecar, 'sidecar.json'),
+      JSON.stringify({ builtin: 'schedule', created_by: 'anti-claude', display_name: 'Ours', args: ['0 9 * * *'] })
+    );
+
+    /* CLI settings setup */
+    const cliDir = path.join(h.home, '.gemini', 'antigravity-cli');
+    fs.mkdirSync(cliDir, { recursive: true });
+    fs.writeFileSync(path.join(cliDir, 'settings.json'), JSON.stringify({ toolPermission: 'ask' }, null, 2));
+
+    const inst1 = runInstallCli(h.home, ['install', '--cli']);
+    assert.equal(inst1.status, 0, inst1.stderr);
+
+    /* Bug #35: symlink & 0600 mode preserved on AGENTS.md */
+    const agentsPath = path.join(h.home, '.gemini', 'AGENTS.md');
+    assert.equal(fs.lstatSync(agentsPath).isSymbolicLink(), true, 'AGENTS.md symlink preserved');
+    assert.equal(fs.statSync(realAgents).mode & 0o777, 0o600, 'AGENTS.md target 0600 mode preserved');
+
+    /* Bug #6: User sets custom statusLine, then re-runs install -> custom statusLine must be respected */
+    const customSettings = JSON.parse(fs.readFileSync(path.join(cliDir, 'settings.json'), 'utf8'));
+    customSettings.statusLine = { type: 'command', command: '/usr/local/bin/user-custom-sl', enabled: true };
+    fs.writeFileSync(path.join(cliDir, 'settings.json'), JSON.stringify(customSettings, null, 2));
+
+    const inst2 = runInstallCli(h.home, ['install', '--cli']);
+    assert.equal(inst2.status, 0, inst2.stderr);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(cliDir, 'settings.json'), 'utf8')).statusLine.command,
+      '/usr/local/bin/user-custom-sl',
+      're-running install preserves user custom statusLine'
+    );
+
+    /* Bug #5: Corrupt install-state.json -> re-running install must NOT overwrite original backup/custom.css */
+    const stateFile = path.join(h.home, '.gemini', 'antigravity', 'anti-claude', 'install-state.json');
+    fs.writeFileSync(stateFile, '{corrupt json', 'utf8');
+    const inst3 = runInstallCli(h.home, ['install']);
+    assert.equal(inst3.status, 0, inst3.stderr);
+    const bakCss = fs.readFileSync(
+      path.join(h.home, '.gemini', 'antigravity', 'anti-claude', 'backup', 'custom.css'),
+      'utf8'
+    );
+    assert.equal(bakCss, '/* original user css */\n', 'pre-install backup survives corrupt install-state.json');
+
+    /* Bug #3: Uninstall deletes anti-claude sidecar but spares native ac-* sidecar */
+    const un = runInstallCli(h.home, ['uninstall']);
+    assert.equal(un.status, 0, un.stderr);
+    assert.equal(fs.existsSync(nativeAcSidecar), true, 'official ac-* sidecar is NOT deleted on uninstall');
+    assert.equal(fs.existsSync(oursSidecar), false, 'anti-claude owned sidecar is removed on uninstall');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('[Audit-2026-11-21 · Daemon Security & CDP] blocks symlink/case bypasses, sensitive file copy, spoofed Electron host, forged repo sidecarId; restores all 3 bindings on reload', async () => {
+  const daemon = await import(pathToFileURL(path.join(REPO, 'core', 'daemon.mjs')).href);
+
+  /* Bug #38: Case-insensitive & symlink bypasses */
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-sec-2026-'));
+  try {
+    const fakeSshTarget = path.join(os.homedir(), '.ssh');
+    if (process.platform === 'darwin') {
+      assert.equal(daemon.isSafeProjectDir(os.homedir().toLowerCase()), false, 'lowercase HOME rejected on macOS');
+      assert.equal(daemon.isSafeProjectDir(path.join(os.homedir(), '.SSH')), false, 'uppercase .SSH rejected on macOS');
+    }
+    assert.equal(daemon.isSensitiveSourcePath(path.join(os.homedir(), '.ssh', 'id_ed25519')), true);
+
+    const projDir = path.join(tmpRoot, 'safe-proj');
+    fs.mkdirSync(projDir, { recursive: true });
+    const fakeKeyFile = path.join(tmpRoot, 'id_ed25519');
+    fs.writeFileSync(fakeKeyFile, 'PRIVATE KEY');
+    const saved = daemon.saveProjectContext(
+      {
+        dirPath: projDir,
+        files: [{ action: 'add', sourcePath: fakeKeyFile, name: 'id_ed25519' }]
+      },
+      { registryFile: null }
+    );
+    assert.equal(saved.ok, true);
+    assert.equal(saved.files.length, 0, 'sensitive key file refused by saveProjectContext add');
+
+    if (fs.existsSync(fakeSshTarget)) {
+      const symToSsh = path.join(tmpRoot, 'innocent-link');
+      fs.symlinkSync(fakeSshTarget, symToSsh);
+      assert.equal(daemon.isSafeProjectDir(symToSsh), false, 'symlink pointing to ~/.ssh is rejected');
+    }
+
+    /* Suspicious #22: Cloned repo claiming a foreign sidecarId in project-context.json cannot delete it */
+    const sidecarsDir = path.join(tmpRoot, 'sidecars');
+    const victimDir = path.join(tmpRoot, 'victim-proj');
+    fs.mkdirSync(victimDir, { recursive: true });
+    const victimScDir = path.join(sidecarsDir, 'victim-job');
+    fs.mkdirSync(victimScDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(victimScDir, 'sidecar.json'),
+      JSON.stringify({
+        builtin: 'schedule',
+        display_name: 'Victim',
+        args: ['0 9 * * *', 'agentapi', 'new-conversation', '--', 'hi'],
+        agent_permissions: { workspace_uris: [pathToFileURL(victimDir).href] }
+      })
+    );
+    const clonedDir = path.join(tmpRoot, 'cloned-malicious');
+    fs.mkdirSync(path.join(clonedDir, '.anti-claude'), { recursive: true });
+    fs.writeFileSync(
+      path.join(clonedDir, '.anti-claude', 'project-context.json'),
+      JSON.stringify({
+        schema: 1,
+        scheduledTasks: [{ id: 'forged', name: 'Forged', sidecarId: 'victim-job' }]
+      })
+    );
+    const delForged = daemon.deleteProjectScheduledTask(
+      { dirPath: clonedDir, taskId: 'forged', sidecarId: 'victim-job' },
+      { sidecarsDir }
+    );
+    assert.equal(delForged.ok, false);
+    assert.equal(delForged.error, 'sidecar_not_in_project');
+    assert.equal(fs.existsSync(victimScDir), true, 'victim sidecar untouched when cloned repo forges sidecarId');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+
+  /* Bug #37: Electron-UA localhost page spoofing __APP_CONFIG__ & data-agy-theme is rejected */
+  if (JSDOM) {
+    const spoofEl = new JSDOM('<!doctype html><body data-agy-theme="dark"></body>', {
+      runScripts: 'outside-only',
+      url: 'http://127.0.0.1:3000/',
+      userAgent: 'Mozilla/5.0 Antigravity/2.34.0 Chrome/152.0.0.0 Electron/44.9.1 Safari/537.36'
+    });
+    spoofEl.window.__APP_CONFIG__ = { productName: 'antigravity' };
+    assert.equal(
+      spoofEl.window.eval(daemon.HOST_IDENTITY_PROBE_EXPR),
+      'non_host',
+      'spoofed __APP_CONFIG__ and data-agy-theme in Electron webview is rejected'
+    );
+    spoofEl.window.close();
+  }
+
+  /* Bug #32 & Suspicious #19: reload re-binds all 3 bindings; stale socket close does not delete newer entry */
+  const realWS = globalThis.WebSocket;
+  daemon.rebuildBundleIfNeeded();
+  daemon.attachedTargets.clear();
+  daemon.skippedNonHostTargets.clear();
+  const sockets = [];
+  const addedBindings = [];
+
+  class ReloadFakeSocket extends EventTarget {
+    static OPEN = 1;
+    constructor() {
+      super();
+      this.readyState = 1;
+      sockets.push(this);
+      queueMicrotask(() => this.dispatchEvent(new Event('open')));
+    }
+    emitEvent(method, params) {
+      this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ method, params }) }));
+    }
+    send(raw) {
+      const { id, method, params } = JSON.parse(raw);
+      const reply = (result = {}) =>
+        this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ id, result }) }));
+      queueMicrotask(() => {
+        if (method === 'Page.getFrameTree') reply({ frameTree: { frame: { id: 'f-main' } } });
+        else if (method === 'Runtime.enable') {
+          this.emitEvent('Runtime.executionContextCreated', {
+            context: { id: 10, origin: 'https://127.0.0.1:60000', auxData: { frameId: 'f-main', isDefault: true } }
+          });
+          reply({});
+        } else if (method === 'Runtime.addBinding') {
+          addedBindings.push(params.name);
+          reply({});
+        } else if (method === 'Runtime.evaluate' && String(params.expression).includes("return 'swarm'")) {
+          reply({ result: { value: 'host' } });
+        } else reply({ result: { value: 'dark' } });
+      });
+    }
+    close() {
+      this.readyState = 3;
+      this.dispatchEvent(new Event('close'));
+    }
+  }
+
+  try {
+    globalThis.WebSocket = ReloadFakeSocket;
+    const fakePage = {
+      id: 'reload-target-1',
+      type: 'page',
+      url: 'https://127.0.0.1:60000/c/11111111-1111-1111-1111-111111111111',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:60000/devtools/page/reload-target-1'
+    };
+    const ep = { channel: 'test', portFile: '', fallbackPort: 0, conversationsDir: os.tmpdir() };
+    await daemon.attachTarget(fakePage, ep);
+    addedBindings.length = 0;
+
+    /* Trigger top-level navigation reload */
+    sockets[0].emitEvent('Page.frameNavigated', { frame: { id: 'f-main', url: fakePage.url } });
+    sockets[0].emitEvent('Runtime.executionContextCreated', {
+      context: { id: 20, origin: 'https://127.0.0.1:60000', auxData: { frameId: 'f-main', isDefault: true } }
+    });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.deepEqual(
+      addedBindings.sort(),
+      ['__agProjectRpc', '__agRequestMetrics', '__agSyncHostThemeMode'],
+      'all 3 Runtime bindings are restored after top-level reload'
+    );
+
+    /* Replace target with a newer socket, then fire delayed close on old socket */
+    const firstSock = sockets[0];
+    await daemon.attachTarget(fakePage, ep);
+    const newerEntry = daemon.attachedTargets.get(fakePage.id);
+    firstSock.close();
+    assert.equal(daemon.attachedTargets.get(fakePage.id), newerEntry, 'delayed close on old socket preserves newer entry');
+  } finally {
+    for (const [, e] of daemon.attachedTargets.entries()) {
+      try {
+        e.ws.close();
+      } catch {}
+    }
+    daemon.attachedTargets.clear();
+    globalThis.WebSocket = realWS;
+  }
+});
+
+test('[Audit-2026-11-21 · Projects UI] aborts save when readContext fails, renders Sunday correctly, escapes search XSS, requires confirm on task delete, disambiguates same-name @ mentions, keeps skill modal alive when Projects off', { skip: skipDom }, async () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const dom = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div class="bg-sidebar">
+          <button data-testid="automations-button">Automations</button>
+          <div data-testid="conversation-list-sidebar"><div class="w-full relative"></div></div>
+        </div>
+        <main>
+          <div data-testid="customizations-page">
+            <div class="sticky top-0"><div><input data-testid="customizations-search" type="search" /></div></div>
+            <div>
+              <section><div><h3>Skills &amp; Rules</h3><button data-testid="skills-rules-filter">All</button></div></section>
+            </div>
+          </div>
+        </main>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/customizations/installed', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  const projDir = '/tmp/proj-audit-ui';
+  const state = {
+    sidebarProjects: {
+      projects: [{ id: 'p-1', name: 'Alpha Case', folderUris: [pathToFileURL(projDir).href], archived: false }]
+    },
+    trajectorySummaries: { summaries: {}, indexes: { byProject: {} } }
+  };
+  const mockStore = { getState: () => state, subscribe: () => () => {}, dispatch: () => {} };
+  const mockRpcSvc = {
+    findFiles: async () => ({
+      uris: [
+        {
+          absoluteUri: pathToFileURL(path.join(projDir, 'src/a/index.ts')).href,
+          workspaceUrisToRelativePaths: { [pathToFileURL(projDir).href]: 'src/a/index.ts' },
+          numFiles: 1
+        },
+        {
+          absoluteUri: pathToFileURL(path.join(projDir, 'src/b/index.ts')).href,
+          workspaceUrisToRelativePaths: { [pathToFileURL(projDir).href]: 'src/b/index.ts' },
+          numFiles: 1
+        }
+      ]
+    })
+  };
+  doc.querySelector('.bg-sidebar').__reactFiber$u = {
+    memoizedProps: { sidebarStore: mockStore },
+    dependencies: {
+      firstContext: { memoizedValue: { store: mockStore }, next: { memoizedValue: mockRpcSvc, next: null } }
+    },
+    return: null
+  };
+
+  const mockCtxFiles = [
+    { name: 'index.ts', relPath: 'src/a/index.ts', absPath: path.join(projDir, 'src/a/index.ts'), size: 120 },
+    { name: 'index.ts', relPath: 'src/b/index.ts', absPath: path.join(projDir, 'src/b/index.ts'), size: 140 }
+  ];
+  const mockSchedTasks = [
+    {
+      id: 't-sun',
+      name: 'Sunday Digest',
+      description: 'Weekly review',
+      instructions: 'Summarize week',
+      frequency: 'weekly',
+      dayOfWeek: 0,
+      time: '10:00',
+      externalSidecar: true
+    }
+  ];
+  let saveContextCalls = 0;
+  let deleteTaskCalls = 0;
+  let readShouldFail = false;
+  window.__agProjectCall = async (action, payload) => {
+    if (action === 'listContexts') {
+      return {
+        ok: true,
+        contexts: {
+          [projDir]: {
+            ok: true,
+            dirPath: projDir,
+            instructions: 'Keep me',
+            files: mockCtxFiles,
+            extraFolders: [],
+            scheduledTasks: mockSchedTasks
+          }
+        }
+      };
+    }
+    if (action === 'readContext') {
+      if (readShouldFail || payload?.dirPath === '/tmp/proj-timeout-case') return { ok: false, error: 'timeout' };
+      return {
+        ok: true,
+        dirPath: projDir,
+        instructions: 'Keep me',
+        files: mockCtxFiles,
+        extraFolders: [],
+        scheduledTasks: mockSchedTasks
+      };
+    }
+    if (action === 'saveContext') {
+      saveContextCalls += 1;
+      return { ok: true, dirPath: projDir, instructions: '', files: [], extraFolders: [], scheduledTasks: [] };
+    }
+    if (action === 'deleteScheduledTask') {
+      deleteTaskCalls += 1;
+      return { ok: true, dirPath: projDir, instructions: 'Keep me', files: [], extraFolders: [], scheduledTasks: [] };
+    }
+    if (action === 'pickFolder') {
+      return { ok: true, folderPath: '/tmp/other-folder', name: 'other-folder' };
+    }
+    return { ok: true };
+  };
+
+  window.ctx = {
+    modules: { i18n: false, claudeUxProjects: true, claudeUxCustomizations: true, claudeUxHideSidebarProjects: false },
+    onCleanup: () => {}
+  };
+  window.eval(customJsSrc);
+
+  try {
+    /* Open Projects -> verify XSS search escaping (Bug #39) */
+    doc.getElementById('ag-claude-projects-nav-btn').click();
+    await new Promise((r) => setTimeout(r, 30));
+    const searchInput = doc.getElementById('ag-proj-search-input');
+    searchInput.value = '<img id="xss-probe" src=x>';
+    searchInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+    assert.equal(doc.getElementById('xss-probe'), null, 'search empty state escapes HTML markup');
+    searchInput.value = '';
+    searchInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    /* Enter project -> verify Sunday display (Bug #40) & 2-step delete confirm (Bug #2) */
+    doc.querySelector('.ag-proj-card').click();
+    await new Promise((r) => setTimeout(r, 40));
+    const schedHtml = doc.querySelector('.ag-pd-sched-list')?.textContent || '';
+    assert.match(schedHtml, /Weekly Sun/, 'dayOfWeek=0 renders as Sunday, not Monday');
+
+    const delBtn = doc.querySelector('[data-ag-pd-del-sched="t-sun"]');
+    delBtn.click();
+    assert.equal(deleteTaskCalls, 0, 'first click on task delete arms confirmation without deleting immediately');
+    assert.equal(delBtn.getAttribute('data-confirm'), '1');
+
+    /* Bug #8: Same-name files src/a/index.ts and src/b/index.ts get distinct mention tokens */
+    const comp = doc.getElementById('ag-pd-composer-input');
+    comp.value = '@files:index';
+    comp.selectionStart = comp.value.length;
+    comp.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 40));
+    const rows1 = doc.querySelectorAll('#ag-pd-mention-popover .ag-pd-mention-row');
+    assert.equal(rows1.length, 2);
+    rows1[0].dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+
+    comp.value += '@files:index';
+    comp.selectionStart = comp.value.length;
+    comp.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 40));
+    const rows2 = doc.querySelectorAll('#ag-pd-mention-popover .ag-pd-mention-row');
+    rows2[1].dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    const pills = doc.querySelectorAll('#ag-pd-mention-pills .ag-pd-mention-pill');
+    assert.equal(pills.length, 2, 'two same-named files produce two distinct mention pills without overwriting');
+    const pillTokens = Array.from(pills).map((el) => el.getAttribute('data-ag-pd-pill-tok'));
+    assert.notEqual(pillTokens[0], pillTokens[1], 'same-name files receive distinct disambiguated tokens');
+
+    /* Bug #1: readContext timeout on uncached project aborts saveContext instead of wiping attachments */
+    state.sidebarProjects.projects.push({
+      id: 'p-timeout',
+      name: 'Timeout Case',
+      folderUris: [pathToFileURL('/tmp/proj-timeout-case').href],
+      archived: false
+    });
+    doc.querySelector('[data-ag-pd-back]').click();
+    await new Promise((r) => setTimeout(r, 20));
+    doc.querySelector('.ag-proj-card[data-ag-proj-id="p-timeout"]').click();
+    await new Promise((r) => setTimeout(r, 30));
+    doc.querySelector('[data-ag-pd-folder-toggle]').click();
+    doc.querySelector('[data-ag-pd-add-folder]').click();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(saveContextCalls, 0, 'saveContext is never called when readContext fails/times out');
+
+    /* Bug #23: Even when Projects feature is disabled, Add Skill modal survives sync cycles and closes on Escape */
+    doc.getElementById('ag-claude-projects-nav-btn').click(); // back to grid
+    doc.getElementById('ag-claude-projects-nav-btn').click(); // close projects view
+    doc.getElementById('ag-cust-add-skill-btn').click();
+    assert.ok(doc.getElementById('ag-claude-project-modal'), 'Add skill modal opened');
+    const escEv = new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    doc.dispatchEvent(escEv);
+    assert.equal(doc.getElementById('ag-claude-project-modal'), null, 'Escape closes Add Skill modal');
+  } finally {
+    window.close();
+  }
+
+  /* Bug #23 dedicated test: claudeUxProjects: false must NOT destroy Add Skill modal across sync ticks and Escape works */
+  const domOff = new JSDOM(
+    `<!doctype html><html><body>
+      <div id="root">
+        <div class="sticky top-0"><div><input data-testid="customizations-search" type="search" /></div></div>
+        <div><section><div><h3>Skills &amp; Rules</h3><button data-testid="skills-rules-filter">All</button></div></section></div>
+      </div>
+    </body></html>`,
+    { url: 'https://127.0.0.1:62683/customizations/installed', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  domOff.window.ctx = { modules: { i18n: false, claudeUxProjects: false, claudeUxCustomizations: true }, onCleanup: () => {} };
+  domOff.window.eval(customJsSrc);
+  try {
+    const docOff = domOff.window.document;
+    docOff.getElementById('ag-cust-add-skill-btn').click();
+    assert.ok(docOff.getElementById('ag-claude-project-modal'), 'Add skill modal opens with Projects off');
+    /* Trigger a DOM mutation to invoke syncStepStream -> syncProjectsWorkspace */
+    const ping = docOff.createElement('span');
+    docOff.body.appendChild(ping);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.ok(docOff.getElementById('ag-claude-project-modal'), 'Add skill modal survives sync ticks with Projects disabled');
+    docOff.dispatchEvent(new domOff.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    assert.equal(docOff.getElementById('ag-claude-project-modal'), null, 'Escape closes Add skill modal even when Projects is disabled');
+  } finally {
+    domOff.window.close();
+  }
+});
+
+test('[Audit-2026-11-21 · Model Menu, Pill & TodoWrite] Option+click works on fallback path, customCss:false skips hijack, 1-5 ignored in input, pill restore keeps streamed suffix, unrelated all-[x] list stays visible', { skip: skipDom }, async () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+
+  /* Bug #13 & #19: Redux fallback path still allows Option+click and renders Native menu row; 1-5 ignored when input focused */
+  {
+    const dom = new JSDOM(
+      `<!doctype html><html><body><div id="root">
+        <div class="bg-sidebar"><div data-testid="conversation-list-sidebar"><div class="w-full relative"></div></div></div>
+        <div id="antigravity.agentSidePanelInputBox">
+          <div contenteditable="true" id="chat-ed">hello</div>
+          <button type="button" data-testid="model-selector-trigger">Gemini 4 Neon High</button>
+        </div>
+      </div></body></html>`,
+      { url: 'https://127.0.0.1:62683/c/c-fb', pretendToBeVisual: true, runScripts: 'outside-only' }
+    );
+    const { window } = dom;
+    const doc = window.document;
+    const mockStore = {
+      getState: () => ({
+        userStatus: {
+          cascadeModelConfigData: {
+            clientModelConfigs: [
+              { label: 'Gemini 4 Neon (High)', value: 1 },
+              { label: 'Gemini 4 Argon (High)', value: 2 },
+              { label: 'Gemini 4 Carbon (High)', value: 3 }
+            ]
+          }
+        },
+        modelSelection: {
+          default: { model: 1 }
+        },
+        trajectorySummaries: { summaries: {} },
+        sidebarProjects: { projects: [] }
+      }),
+      subscribe: () => () => {},
+      dispatch: () => {}
+    };
+    doc.querySelector('.bg-sidebar').__reactFiber$s = { memoizedProps: { sidebarStore: mockStore }, return: null };
+    const btn = doc.querySelector('button[data-testid="model-selector-trigger"]');
+    btn.getBoundingClientRect = () => ({ left: 40, top: 760, right: 240, bottom: 788, width: 200, height: 28 });
+
+    window.ctx = { config: { modules: { customCss: true } }, modules: { i18n: false, claudeUxModelMenu: true }, onCleanup: () => {} };
+    window.eval(customJsSrc);
+    try {
+      /* Option+click on Redux fallback path must NOT be prevented */
+      const altEv = new window.MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, altKey: true });
+      btn.dispatchEvent(altEv);
+      assert.equal(altEv.defaultPrevented, false, 'Option+click passes through even on Redux fallback path');
+
+      /* Plain click opens custom menu with Native menu row */
+      btn.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 }));
+      const pop = doc.getElementById('ag-claude-model-popover');
+      assert.equal(pop.getAttribute('data-open'), 'true');
+      assert.ok(pop.querySelector('[data-ag-cm-native]'), 'Native menu row rendered even on Redux fallback path');
+
+      /* Bug #19: Focusing editable composer and typing '2' must NOT be swallowed by open model menu */
+      const ed = doc.getElementById('chat-ed');
+      ed.focus();
+      Object.defineProperty(doc, 'activeElement', { value: ed, configurable: true });
+      const key2 = new window.KeyboardEvent('keydown', { key: '2', bubbles: true, cancelable: true });
+      ed.dispatchEvent(key2);
+      assert.equal(key2.defaultPrevented, false, 'digit key 2 inside composer is not swallowed by open model menu');
+    } finally {
+      window.close();
+    }
+  }
+
+  /* Bug #24: customCss: false disables model trigger interception */
+  {
+    const { api } = thirdPartyOnlyApi();
+    const dom = new JSDOM(
+      `<!doctype html><html><body><div id="root"><button type="button" data-testid="model-selector-trigger">Model</button></div></body></html>`,
+      { url: 'https://127.0.0.1:62683/c/c-nocss', pretendToBeVisual: true, runScripts: 'outside-only' }
+    );
+    const { window } = dom;
+    const btn = window.document.querySelector('button[data-testid="model-selector-trigger"]');
+    btn.__reactFiber$n = { memoizedProps: { value: api }, return: null };
+    window.ctx = { config: { modules: { customCss: false } }, modules: { claudeUxModelMenu: true }, onCleanup: () => {} };
+    window.eval(customJsSrc);
+    try {
+      const ev = new window.MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 });
+      btn.dispatchEvent(ev);
+      assert.equal(ev.defaultPrevented, false, 'model menu does not hijack trigger when customCss is false');
+    } finally {
+      window.close();
+    }
+  }
+
+  /* Bug #11 & Bug #10: Pill restore preserves streamed text suffix; unrelated all-[x] list after interrupted todo stays visible */
+  {
+    const dom = new JSDOM(
+      `<!doctype html><html><body><div id="root">
+        <div data-testid="conversation-view">
+          <div data-testid="agent-response" id="turn-1">
+            <ul class="contains-task-list">
+              <li><input type="checkbox" checked /> Step A</li>
+              <li>[/] Step B</li>
+              <li><input type="checkbox" /> Step C</li>
+            </ul>
+          </div>
+          <div data-testid="agent-response" id="turn-2">
+            <div data-markdown-root><p><code>foo</code> ，开头</p></div>
+            <ul class="contains-task-list" id="ordinary-checked">
+              <li><input type="checkbox" checked /> Buy milk</li>
+              <li><input type="checkbox" checked /> Walk dog</li>
+            </ul>
+          </div>
+          <div id="antigravity.agentSidePanelInputBox"></div>
+        </div>
+      </div></body></html>`,
+      { url: 'https://127.0.0.1:62683/c/c-pill', pretendToBeVisual: true, runScripts: 'outside-only' }
+    );
+    const { window } = dom;
+    const doc = window.document;
+    window.ctx = { modules: { i18n: false, claudeUxTodoCard: true }, onCleanup: () => {} };
+    window.eval(customJsSrc);
+    try {
+      /* Bug #10: ordinary all-[x] list in turn 2 must NOT be merged/hidden into turn 1's interrupted checklist */
+      const ordinaryUl = doc.getElementById('ordinary-checked');
+      assert.equal(ordinaryUl.hasAttribute('data-ag-todo-merged'), false, 'unrelated all-[x] list in later turn stays visible');
+
+      /* Bug #11: simulate streaming appending more text to the text node after <code> */
+      const codeEl = doc.querySelector('code');
+      const fol = codeEl.nextSibling;
+      assert.equal(fol.nodeValue, '\u2060，开头');
+      fol.nodeValue = '\u2060，开头之后流式追加了很长一段重要内容';
+      window.__agClaudeUxDispose();
+      assert.equal(
+        fol.nodeValue,
+        ' ，开头之后流式追加了很长一段重要内容',
+        'dispose restores boundary whitespace/WJ without truncating streamed suffix'
+      );
+    } finally {
+      window.close();
+    }
+  }
+});
+
+test('[Audit-2026-11-21 · Sidebar & Settings Safety] refuses to hide sidebar or lock scroll when Recents fails to mount; settings CSS guard leaves drifted headers visible', { skip: skipDom }, () => {
+  const customJsSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8');
+  const customCssSrc = fs.readFileSync(path.join(REPO, 'user', 'custom.css'), 'utf8');
+
+  /* Bug #17: CSS FOUC shield must be gated on data-ag-stats-ready="1" */
+  assert.match(
+    customCssSrc,
+    /\[data-testid="settings-sidebar"\]\[data-ag-stats-ready="1"\]/,
+    'settings sidebar CSS hide rules are gated by JS data-ag-stats-ready flag'
+  );
+  /* Settings panel switches must match Antigravity native h-6 w-11 (44x24px) & thumb h-4 w-4 (16x16px, 4px/24px) */
+  assert.match(
+    customCssSrc,
+    /#ag-claude-ux-settings-panel\s+\.ag-claude-switch\s*\{[^}]*width:\s*44px\s*!important;[^}]*height:\s*24px\s*!important;/s,
+    'UI Enhancements settings switches match native 44x24px size'
+  );
+  assert.match(
+    customCssSrc,
+    /#ag-claude-ux-settings-panel\s+\.ag-claude-switch\[aria-checked="true"\]\s*>\s*span\s*\{[^}]*translateX\(24px\)/s,
+    'UI Enhancements settings switch checked thumb offset matches native 24px'
+  );
+
+  /* Bug #12 & #18: On a React host (#root present) where sidebar store cannot be found, native rows stay visible and scrollTop is not forced to 0 */
+  const dom = new JSDOM(
+    `<!doctype html><html><body><div id="root">
+      <div class="bg-sidebar">
+        <div data-testid="conversation-list-sidebar">
+          <div class="w-full relative" style="height: 400px;">
+            <div data-index="0"><div data-testid="section-header" data-title="Conversations">Conversations</div></div>
+            <div data-index="1"><div data-testid="conversation-row-sidebar"><a href="/c/c-1">Chat 1</a></div></div>
+          </div>
+        </div>
+      </div>
+      <div data-testid="settings-sidebar">
+        <div class="px-4 mt-2"><h2>Renamed Unknown Section</h2></div>
+        <div class="flex flex-col gap-0.5"><button>Item 1</button></div>
+      </div>
+    </div></body></html>`,
+    { url: 'https://127.0.0.1:62683/c/c-1', pretendToBeVisual: true, runScripts: 'outside-only' }
+  );
+  const { window } = dom;
+  const doc = window.document;
+  const scrollBox = doc.querySelector('[data-testid="conversation-list-sidebar"]');
+  scrollBox.scrollTop = 120;
+
+  window.ctx = { modules: { i18n: false, claudeUxHideSidebarProjects: true }, onCleanup: () => {} };
+  window.eval(customJsSrc);
+  try {
+    assert.equal(doc.querySelector('[data-index="1"]').hasAttribute('data-ag-sb-hide-proj'), false, 'native rows stay visible when Recents cannot mount');
+    assert.equal(scrollBox.scrollTop, 120, 'scrollTop is not locked to 0 when unified Recents is not active');
+    assert.equal(
+      doc.querySelector('[data-testid="settings-sidebar"]').hasAttribute('data-ag-stats-ready'),
+      false,
+      'drifted settings sidebar does not activate CSS hide shield'
     );
   } finally {
     window.close();
