@@ -89,6 +89,7 @@ test('fresh install deploys standalone user layer and uninstall removes state cl
     assert.match(h.read('.gemini/AGENTS.md'), /BEGIN anti-claude/);
     assert.match(h.read('.gemini/AGENTS.md'), /Execution Progress Sync/);
     assert.match(h.read('.gemini/AGENTS.md'), /same language the user is speaking/);
+    assert.match(h.read('.gemini/AGENTS.md'), /update_steps/);
     assert.match(h.read('.gemini/AGENTS.md'), /ask_question/);
 
     const un = run(h, ['uninstall']);

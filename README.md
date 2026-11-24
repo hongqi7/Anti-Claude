@@ -34,7 +34,7 @@ node ~/Developer/Anti-Claude/install.mjs uninstall             # Uninstall and r
 
 By default, Antigravity hides reasoning inside collapsed `thinking` blocks, runs dozens of tool calls silently, and folds the entire turn under a single `Worked for Xm` wrapper when finished (or discards tool rows completely in Knowledge Work mode). Anti-Claude changes this in two ways:
 
-- **Interleaved narration flow**: Strips empty filler; before each tool call, the agent writes 1–2 concise sentences explaining what it just found and what it is checking next, creating a clean `brief update → expandable tool row → next update` rhythm. Progress updates and command summaries automatically match the user's conversation language (defaulting to English).
+- **Interleaved narration & proactive native checklist**: Strips empty filler; before each tool call, the agent writes 1–2 concise sentences explaining what it just found and what it is checking next, creating a clean `brief update → expandable tool row → next update` rhythm. For multi-step work (including diagnostics, log analysis, research, and multi-file edits), prompts the agent to proactively trigger Antigravity's native `update_steps` checklist and `update_focus` status in parallel from turn one. Progress updates, command summaries, and step labels automatically match the user's conversation language (defaulting to English).
 - **Unfolded step stream & live elapsed timers**: Automatically unlocks the client's full step-detail engine and unwraps the outer end-of-turn `Worked for Xm` collapse. Actively running tool rows show orbiting blue dots with a live elapsed timer, while expanded thinking blocks step back into muted grey prose.
 
 ### 2. Desktop UI & Everyday Controls
@@ -57,7 +57,7 @@ By default, Antigravity hides reasoning inside collapsed `thinking` blocks, runs
 
 The installer never touches `/Applications/Antigravity.app`. It only manages the following user-level files (tracked in `~/.gemini/antigravity/anti-claude/install-state.json` and cleanly restored on `uninstall`):
 
-- `~/.gemini/AGENTS.md`: Adds the execution-sync and `ask_question` collaboration rule block (skip with `--no-agents-rule`).
+- `~/.gemini/AGENTS.md`: Adds the execution-sync, proactive native `update_steps` / `update_focus`, and `ask_question` collaboration rule block (skip with `--no-agents-rule`).
 - `antigravity_state.pbtxt` & `~/.gemini/config/config.json`: Enables detailed step visibility (skip with `--no-step-unlock`).
 - `~/.gemini/antigravity/anti-claude/user/`: Deploys standalone CSS, JS, and config powered by Anti-Claude's built-in zero-dependency `core/` CDP runtime (preserves local customizations via 3-way JSON merge; legacy `theme-patch` installs are migrated and retired automatically).
 - `~/.gemini/antigravity-cli/anti-claude-statusline.mjs` & `~/.gemini/antigravity-cli/settings.json`: Deploys the zero-dependency CLI status bar and enables `statusLine` when `agy` is detected or `--cli` / `--cli-only` is passed (skip with `--no-cli` or `--no-cli-statusline`).
