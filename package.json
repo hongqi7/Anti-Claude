@@ -1,9 +1,15 @@
 {
   "name": "anti-claude",
-  "version": "3.1.5",
+  "version": "3.1.6",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test test/" },
-  "devDependencies": { "jsdom": "^31.0.1" }
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
 }

@@ -2648,7 +2648,7 @@
     'open', 'setIsOpen', 'customModels', 'supportsCustomModels', 'showCustomModelHeader', 'onAddCustomModel',
     'onEditCustomModel', 'bestOfNConfig', 'contextWindow', 'isModelListLoading', 'finalFocus', 'footerExtra',
     'orchestratorPick', 'children', 'groups', 'effortIndex', 'orchestratorPlanners', 'orchestratorPlannerIndex',
-    'orchestratorDefaultPlanner'
+    'orchestratorDefaultPlanner', 'orchestratorExecutors', 'lockedReason'
   ]);
   let bypassNativeModelTriggerUntil = 0;
 
@@ -2667,6 +2667,9 @@
   function nativeModelMenuGaps(api) {
     const gaps = { hard: [], soft: [] };
     if (!api || api.isReduxFallback) return gaps;
+    /* v2.35+ `lockedReason`: the official selector is deliberately pinned shut (e.g. managed/policy
+       environments). Mirroring upstream, our own popover must step aside so the locked state stays intact. */
+    if (api.lockedReason !== undefined && api.lockedReason !== null) gaps.hard.push('lockedReason');
     if (api.bestOfNConfig && api.bestOfNConfig.isBestOfNEnabled === true) gaps.hard.push('bestOfN');
     if (api.footerExtra) gaps.soft.push('footerExtra');
     if (api.supportsCustomModels === true) gaps.soft.push('customModels');
@@ -3145,36 +3148,62 @@
       shortSummary: '',
       defaultShortLabel: ''
     };
-    /* Strictly mirror official Antigravity oW() / LSb(): never expose non-whitelisted executor models */
-    if (!Array.isArray(cachedExecutorRoleBaseIds) || cachedExecutorRoleBaseIds.length === 0) {
-      return empty;
-    }
-    const rawOpts = ((api && api.modelOptions) || []).filter(
-      (o) => o && !o.disabled && !o.isCustom && o.value !== undefined && o.value !== 0 && o.label && !isOrchestratorModelOpt(o)
-    );
-    if (!rawOpts.length) return empty;
-    const roleOrder = cachedExecutorRoleBaseIds;
-    const roleSet = new Set(roleOrder);
+    /* v2.35+: the official selector context now exposes `orchestratorExecutors` — the exact
+       whitelisted executor option list upstream renders. Prefer it directly when present; only
+       fall back to the orchestrator-model-roles flag + modelOptions reconstruction otherwise. */
     const stripEffortId = (id) => String(id || '').replace(/-(low|medium|high|xhigh|max)$/i, '');
-    const candidateOpts = rawOpts.filter((o) => o.modelId && roleSet.has(stripEffortId(o.modelId)));
-    if (!candidateOpts.length) return empty;
-
-    const famMap = new Map();
-    for (const opt of candidateOpts) {
-      const parsed = parseModelLabelEffort(opt.label);
-      const baseId = stripEffortId(opt.modelId);
-      let fam = famMap.get(baseId);
-      if (!fam) {
-        fam = { baseName: parsed.baseName, baseId, variants: [] };
-        famMap.set(baseId, fam);
+    let families = [];
+    const officialExecOpts = Array.isArray(api && api.orchestratorExecutors)
+      ? api.orchestratorExecutors.filter((o) => o && !o.disabled && o.label && o.value !== undefined)
+      : [];
+    if (officialExecOpts.length > 0) {
+      const famMap = new Map();
+      officialExecOpts.forEach((opt, idx) => {
+        const parsed = parseModelLabelEffort(opt.label);
+        const baseId = opt.modelId ? stripEffortId(opt.modelId) : `__exec_${idx}`;
+        let fam = famMap.get(baseId);
+        if (!fam) {
+          fam = { baseName: parsed.baseName, baseId, variants: [], _order: idx };
+          famMap.set(baseId, fam);
+        }
+        fam.variants.push({ effort: parsed.effort, opt });
+      });
+      families = Array.from(famMap.values());
+      for (const fam of families) {
+        sortFamilyVariants(fam.variants);
       }
-      fam.variants.push({ effort: parsed.effort, opt });
+      families.sort((a, b) => a._order - b._order);
+    } else {
+      /* Strictly mirror official Antigravity oW() / LSb(): never expose non-whitelisted executor models */
+      if (!Array.isArray(cachedExecutorRoleBaseIds) || cachedExecutorRoleBaseIds.length === 0) {
+        return empty;
+      }
+      const rawOpts = ((api && api.modelOptions) || []).filter(
+        (o) => o && !o.disabled && !o.isCustom && o.value !== undefined && o.value !== 0 && o.label && !isOrchestratorModelOpt(o)
+      );
+      if (!rawOpts.length) return empty;
+      const roleOrder = cachedExecutorRoleBaseIds;
+      const roleSet = new Set(roleOrder);
+      const candidateOpts = rawOpts.filter((o) => o.modelId && roleSet.has(stripEffortId(o.modelId)));
+      if (!candidateOpts.length) return empty;
+
+      const famMap = new Map();
+      for (const opt of candidateOpts) {
+        const parsed = parseModelLabelEffort(opt.label);
+        const baseId = stripEffortId(opt.modelId);
+        let fam = famMap.get(baseId);
+        if (!fam) {
+          fam = { baseName: parsed.baseName, baseId, variants: [] };
+          famMap.set(baseId, fam);
+        }
+        fam.variants.push({ effort: parsed.effort, opt });
+      }
+      families = Array.from(famMap.values());
+      for (const fam of families) {
+        sortFamilyVariants(fam.variants);
+      }
+      families.sort((a, b) => roleOrder.indexOf(a.baseId) - roleOrder.indexOf(b.baseId));
     }
-    const families = Array.from(famMap.values());
-    for (const fam of families) {
-      sortFamilyVariants(fam.variants);
-    }
-    families.sort((a, b) => roleOrder.indexOf(a.baseId) - roleOrder.indexOf(b.baseId));
 
     const defaultFamily = families[0] || null;
     const defaultVariant =
