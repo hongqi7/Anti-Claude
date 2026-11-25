@@ -288,6 +288,121 @@ function isUncPath(p) {
   return s.startsWith('\\\\') || s.startsWith('//') || s.startsWith('/mnt/');
 }
 
+let wslGeminiCache = { at: 0, dirs: [], wslMissing: false };
+const SAFE_WSL_DISTRO_RE = /^[a-zA-Z0-9._-]+$/;
+
+export function discoverWslGeminiDirs({ force = false } = {}) {
+  const envRaw = String(process.env.ANTI_CLAUDE_WSL_GEMINI_DIR || '').trim();
+  if (envRaw) {
+    return envRaw
+      .split(path.delimiter)
+      .map((s) => s.trim())
+      .filter((s) => {
+        if (!s) return false;
+        try {
+          const st = fs.statSync(s, { throwIfNoEntry: false });
+          return Boolean(st && st.isDirectory());
+        } catch {
+          return false;
+        }
+      });
+  }
+  if (process.platform !== 'win32') return [];
+  const now = Date.now();
+  const ttl = wslGeminiCache.wslMissing ? 300000 : wslGeminiCache.dirs.length > 0 ? 30000 : 15000;
+  if (!force && wslGeminiCache.at > 0 && now - wslGeminiCache.at < ttl) {
+    return wslGeminiCache.dirs;
+  }
+  const found = [];
+  const seen = new Set();
+  const addCandidate = (dirPath) => {
+    const key = dirPath.toLowerCase();
+    if (seen.has(key)) return;
+    try {
+      const st = fs.statSync(dirPath, { throwIfNoEntry: false });
+      if (!st || !st.isDirectory()) return;
+      const convSt = fs.statSync(path.join(dirPath, 'antigravity', 'conversations'), { throwIfNoEntry: false });
+      const cfgSt = fs.statSync(path.join(dirPath, 'config'), { throwIfNoEntry: false });
+      if (!convSt?.isDirectory() && !cfgSt?.isDirectory()) return;
+      seen.add(key);
+      found.push({ dir: dirPath, score: convSt ? convSt.mtimeMs : cfgSt ? cfgSt.mtimeMs : 0 });
+    } catch {}
+  };
+  let wslMissing = false;
+  try {
+    /* Query only running distros so stopped distros are never cold-booted or stalled on UNC access */
+    const buf = execFileSync('wsl.exe', ['-l', '-q', '--running'], { timeout: 2500, windowsHide: true });
+    const txt = buf.includes(0) ? buf.toString('utf16le') : buf.toString('utf8');
+    const distros = txt
+      .replace(/^\uFEFF/, '')
+      .split(/\r?\n/)
+      .map((s) => s.replace(/\0/g, '').trim())
+      .filter((s) => s && SAFE_WSL_DISTRO_RE.test(s) && !/^docker-desktop/i.test(s));
+    for (const distro of distros) {
+      const uncBases = [`\\\\wsl.localhost\\${distro}`, `\\\\wsl$\\${distro}`];
+      let matchedBase = '';
+      for (const base of uncBases) {
+        try {
+          const st = fs.statSync(base, { throwIfNoEntry: false });
+          if (st && st.isDirectory()) {
+            matchedBase = base;
+            break;
+          }
+        } catch {}
+      }
+      if (!matchedBase) continue;
+      const homeRoot = path.join(matchedBase, 'home');
+      try {
+        const users = fs.readdirSync(homeRoot, { withFileTypes: true });
+        for (const u of users) {
+          if (!u.isDirectory() || u.name.startsWith('.')) continue;
+          addCandidate(path.join(homeRoot, u.name, '.gemini'));
+        }
+      } catch {}
+      addCandidate(path.join(matchedBase, 'root', '.gemini'));
+    }
+  } catch (err) {
+    if (err && err.code === 'ENOENT') wslMissing = true;
+  }
+  found.sort((a, b) => b.score - a.score);
+  const dirs = found.map((x) => x.dir);
+  wslGeminiCache = { at: now, dirs, wslMissing };
+  return dirs;
+}
+
+function discoverWslConversationsDirs() {
+  const out = [];
+  for (const gDir of discoverWslGeminiDirs()) {
+    const conv = path.join(gDir, 'antigravity', 'conversations');
+    try {
+      const st = fs.statSync(conv, { throwIfNoEntry: false });
+      if (st && st.isDirectory()) out.push(conv);
+    } catch {}
+  }
+  return out;
+}
+
+export function resolveConversationDirForCascade(cascadeId, conversationsDirOrList) {
+  const dirs = (Array.isArray(conversationsDirOrList) ? conversationsDirOrList : [conversationsDirOrList])
+    .filter((d) => typeof d === 'string' && d.trim());
+  if (!dirs.length) return '';
+  if (!cascadeId || !UUID_RE.test(cascadeId)) return dirs[0];
+  let bestDir = '';
+  let bestMtime = -1;
+  const seen = new Set();
+  for (const dir of dirs) {
+    const key = CASE_INSENSITIVE_FS ? dir.toLowerCase() : dir;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const info = getDbStatByPath(path.join(dir, `${cascadeId}.db`));
+    if (info && info.mtimeMs > bestMtime) {
+      bestMtime = info.mtimeMs;
+      bestDir = dir;
+    }
+  }
+  return bestDir || dirs[0];
+}
+
 function discoverEndpoints() {
   const endpoints = [];
   const defaultConvDir = path.join(HOME, '.gemini', 'antigravity', 'conversations');
@@ -323,11 +438,13 @@ function discoverEndpoints() {
             const winPort = path.join(usersDir, u, 'AppData', 'Roaming', 'Antigravity', 'DevToolsActivePort');
             if (fs.existsSync(path.dirname(winPort))) {
               const winConv = path.join(usersDir, u, '.gemini', 'antigravity', 'conversations');
+              const hasWinConv = fs.existsSync(winConv);
               endpoints.push({
                 channel: `wsl:${u}`,
                 portFile: winPort,
                 fallbackPort: 9222,
-                conversationsDir: fs.existsSync(winConv) ? winConv : defaultConvDir
+                conversationsDir: hasWinConv ? winConv : defaultConvDir,
+                extraConversationsDirs: hasWinConv && winConv !== defaultConvDir ? [defaultConvDir] : []
               });
             }
           }
@@ -1217,7 +1334,9 @@ function getDescendantIds(cascadeId, conversationsDir) {
       return [];
     }
     const seen = new Set();
-    let opens = 0;
+    const uncMode = isUncPath(conversationsDir);
+    const maxBatchOpens = uncMode ? 6 : 20;
+    const candidates = [];
     for (const name of entries) {
       const m = name.match(DB_FILE_RE);
       if (!m) continue;
@@ -1228,10 +1347,17 @@ function getDescendantIds(cascadeId, conversationsDir) {
       const dbPath = path.join(conversationsDir, name);
       const info = getDbStatByPath(dbPath);
       if (!info || (existing && existing.sig === info.sig)) continue;
-      if (opens >= 20) continue;
+      candidates.push({ uuid, dbPath, info });
+    }
+    if (uncMode && candidates.length > maxBatchOpens) {
+      candidates.sort((a, b) => b.info.mtimeMs - a.info.mtimeMs);
+    }
+    let opens = 0;
+    for (const item of candidates) {
+      if (opens >= maxBatchOpens) break;
       opens += 1;
       try {
-        const metaRes = withReadOnlyDb(dbPath, 20, (db) => {
+        const metaRes = withReadOnlyDb(item.dbPath, 20, (db) => {
           const row = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1').get();
           if (!row?.data) return { hasMeta: false, parentId: '', rootId: '' };
           const meta = parseProto(row.data);
@@ -1241,15 +1367,15 @@ function getDescendantIds(cascadeId, conversationsDir) {
             rootId: readUtf8(meta.get(6)).trim()
           };
         });
-        dirState.nodes.set(uuid, { ...metaRes, sig: info.sig });
+        dirState.nodes.set(item.uuid, { ...metaRes, sig: item.info.sig });
       } catch {
-        dirState.nodes.set(uuid, { hasMeta: false, parentId: '', rootId: '', sig: info.sig });
+        dirState.nodes.set(item.uuid, { hasMeta: false, parentId: '', rootId: '', sig: item.info.sig });
       }
     }
     for (const id of Array.from(dirState.nodes.keys())) {
       if (!seen.has(id)) dirState.nodes.delete(id);
     }
-    if (opens < 20) dirState.dirMtimeMs = st.mtimeMs;
+    if (opens < maxBatchOpens) dirState.dirMtimeMs = st.mtimeMs;
   }
 
   const byParent = new Map();
@@ -1348,8 +1474,10 @@ function readSubagentSummaries(descendantIds, conversationsDir) {
   }
 }
 
-function parseConversationMetrics(cascadeId, conversationsDir) {
-  if (!DatabaseSync || !cascadeId || !UUID_RE.test(cascadeId) || !conversationsDir) return null;
+export function parseConversationMetrics(cascadeId, conversationsDirOrList) {
+  if (!DatabaseSync || !cascadeId || !UUID_RE.test(cascadeId) || !conversationsDirOrList) return null;
+  const conversationsDir = resolveConversationDirForCascade(cascadeId, conversationsDirOrList);
+  if (!conversationsDir) return null;
   const dbPath = path.join(conversationsDir, `${cascadeId}.db`);
   const statInfo = getDbStatByPath(dbPath);
   if (!statInfo) return { cascadeId, hasData: false };
@@ -1696,6 +1824,12 @@ function resolveLocalProjectDir(rawDir) {
       if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(p)) p = p.slice(1);
     } catch {
       return null;
+    }
+  }
+  if (process.platform === 'win32') {
+    const mntMatch = p.match(/^\/mnt\/([a-zA-Z])(\/.*)?$/);
+    if (mntMatch) {
+      p = `${mntMatch[1].toUpperCase()}:${(mntMatch[2] || '/').replace(/\//g, '\\')}`;
     }
   }
   const abs = path.resolve(p);
@@ -2943,7 +3077,37 @@ function scanSkillsDirectory(dirPath, source, skillMap) {
   }
 }
 
+function collectEnabledPlugins(configDir) {
+  const rootCfg = readJsonOrFallback(path.join(configDir, 'config.json'), {});
+  const pluginsCfg = rootCfg && typeof rootCfg.plugins === 'object' && rootCfg.plugins ? rootCfg.plugins : {};
+  const pluginsRoot = path.join(configDir, 'plugins');
+  const pluginNames = new Set(Object.keys(pluginsCfg));
+  try {
+    for (const ent of fs.readdirSync(pluginsRoot, { withFileTypes: true })) {
+      if ((ent.isDirectory() || ent.isSymbolicLink()) && !ent.name.startsWith('.')) {
+        pluginNames.add(ent.name);
+      }
+    }
+  } catch {}
+  const enabled = [];
+  for (const name of pluginNames) {
+    const cfg = pluginsCfg[name];
+    if (cfg && typeof cfg === 'object' && cfg.enabled === false) continue;
+    const dir = path.join(pluginsRoot, name);
+    const st = fs.statSync(dir, { throwIfNoEntry: false });
+    if (st && st.isDirectory()) {
+      enabled.push({
+        name,
+        cfg: cfg && typeof cfg === 'object' ? cfg : {},
+        dir
+      });
+    }
+  }
+  return enabled;
+}
+
 export function collectOverviewSnapshot(payload = {}, opts = {}) {
+  const explicitOverride = Boolean(opts.homeDir || opts.geminiDir || opts.configDir || opts.skillsDir || opts.agentsDir);
   const homeDir = opts.homeDir ? path.resolve(opts.homeDir) : HOME;
   const geminiDir = opts.geminiDir ? path.resolve(opts.geminiDir) : path.join(homeDir, '.gemini');
   const configDir = opts.configDir ? path.resolve(opts.configDir) : path.join(geminiDir, 'config');
@@ -2952,6 +3116,11 @@ export function collectOverviewSnapshot(payload = {}, opts = {}) {
   const builtinSkillsDir = opts.builtinSkillsDir
     ? path.resolve(opts.builtinSkillsDir)
     : path.join(geminiDir, 'antigravity', 'builtin', 'skills');
+  const extraGeminiDirs = Array.isArray(opts.extraGeminiDirs)
+    ? opts.extraGeminiDirs.filter((d) => typeof d === 'string' && d.trim())
+    : explicitOverride
+      ? []
+      : discoverWslGeminiDirs();
   const skipGit = Boolean(opts.skipGit);
 
   let absDir = '';
@@ -2967,31 +3136,47 @@ export function collectOverviewSnapshot(payload = {}, opts = {}) {
     git: opts.gitResolved !== undefined ? opts.gitResolved : null
   };
 
-  const rootCfg = readJsonOrFallback(path.join(configDir, 'config.json'), {});
-  const pluginsCfg = rootCfg && typeof rootCfg.plugins === 'object' && rootCfg.plugins ? rootCfg.plugins : {};
-  const enabledPlugins = Object.entries(pluginsCfg)
-    .filter(([, cfg]) => !cfg || cfg.enabled !== false)
-    .map(([name, cfg]) => ({
-      name,
-      cfg: cfg && typeof cfg === 'object' ? cfg : {},
-      dir: path.join(configDir, 'plugins', name)
-    }))
-    .filter((p) => {
-      const st = fs.statSync(p.dir, { throwIfNoEntry: false });
-      return Boolean(st && st.isDirectory());
+  const sources = [
+    {
+      geminiDir,
+      configDir,
+      skillsDir,
+      agentsDir,
+      builtinSkillsDir
+    }
+  ];
+  const seenGeminiRoots = new Set([normalizePathForCompare(geminiDir)]);
+  for (const extraDir of extraGeminiDirs) {
+    const norm = normalizePathForCompare(extraDir);
+    if (seenGeminiRoots.has(norm)) continue;
+    seenGeminiRoots.add(norm);
+    const eCfg = path.join(extraDir, 'config');
+    sources.push({
+      geminiDir: extraDir,
+      configDir: eCfg,
+      skillsDir: path.join(eCfg, 'skills'),
+      agentsDir: path.join(eCfg, 'agents'),
+      builtinSkillsDir: path.join(extraDir, 'antigravity', 'builtin', 'skills')
     });
+  }
+
+  const sourcePlugins = sources.map((src) => ({ src, enabledPlugins: collectEnabledPlugins(src.configDir) }));
 
   /* 1. Rules / Memory files */
   const rules = [];
-  const globalAgentsPath = path.join(geminiDir, 'AGENTS.md');
-  const globalAst = fs.statSync(globalAgentsPath, { throwIfNoEntry: false });
-  if (globalAst && globalAst.isFile()) {
-    rules.push({
-      label: '~/.gemini/AGENTS.md',
-      path: globalAgentsPath,
-      scope: 'global',
-      bytes: globalAst.size
-    });
+  const seenRuleLabels = new Set();
+  for (const { src } of sourcePlugins) {
+    const globalAgentsPath = path.join(src.geminiDir, 'AGENTS.md');
+    const globalAst = fs.statSync(globalAgentsPath, { throwIfNoEntry: false });
+    if (globalAst && globalAst.isFile() && !seenRuleLabels.has('global:~/.gemini/AGENTS.md')) {
+      seenRuleLabels.add('global:~/.gemini/AGENTS.md');
+      rules.push({
+        label: '~/.gemini/AGENTS.md',
+        path: globalAgentsPath,
+        scope: 'global',
+        bytes: globalAst.size
+      });
+    }
   }
   if (absDir) {
     const projAgentsPath = path.join(absDir, 'AGENTS.md');
@@ -3005,33 +3190,40 @@ export function collectOverviewSnapshot(payload = {}, opts = {}) {
       });
     }
   }
-  for (const pl of enabledPlugins) {
-    const rulesDir = path.join(pl.dir, 'rules');
-    let ruleFiles = [];
-    try {
-      ruleFiles = fs.readdirSync(rulesDir).filter((f) => /\.md$/i.test(f));
-    } catch {}
-    for (const file of ruleFiles) {
-      const fp = path.join(rulesDir, file);
-      const st = fs.statSync(fp, { throwIfNoEntry: false });
-      if (st && st.isFile()) {
-        rules.push({
-          label: `${pl.name}/${file}`,
-          path: fp,
-          scope: 'plugin',
-          bytes: st.size
-        });
+  for (const { enabledPlugins } of sourcePlugins) {
+    for (const pl of enabledPlugins) {
+      const rulesDir = path.join(pl.dir, 'rules');
+      let ruleFiles = [];
+      try {
+        ruleFiles = fs.readdirSync(rulesDir).filter((f) => /\.md$/i.test(f));
+      } catch {}
+      for (const file of ruleFiles) {
+        const label = `${pl.name}/${file}`;
+        if (seenRuleLabels.has(`plugin:${label}`)) continue;
+        const fp = path.join(rulesDir, file);
+        const st = fs.statSync(fp, { throwIfNoEntry: false });
+        if (st && st.isFile()) {
+          seenRuleLabels.add(`plugin:${label}`);
+          rules.push({
+            label,
+            path: fp,
+            scope: 'plugin',
+            bytes: st.size
+          });
+        }
       }
     }
   }
 
   /* 2. Skills (priority: user > plugin > builtin) */
   const skillMap = new Map();
-  scanSkillsDirectory(skillsDir, 'user', skillMap);
-  for (const pl of enabledPlugins) {
-    scanSkillsDirectory(path.join(pl.dir, 'skills'), 'plugin', skillMap);
+  for (const { src } of sourcePlugins) scanSkillsDirectory(src.skillsDir, 'user', skillMap);
+  for (const { enabledPlugins } of sourcePlugins) {
+    for (const pl of enabledPlugins) {
+      scanSkillsDirectory(path.join(pl.dir, 'skills'), 'plugin', skillMap);
+    }
   }
-  scanSkillsDirectory(builtinSkillsDir, 'builtin', skillMap);
+  for (const { src } of sourcePlugins) scanSkillsDirectory(src.builtinSkillsDir, 'builtin', skillMap);
   const rankSource = { user: 0, plugin: 1, builtin: 2 };
   const allSkills = Array.from(skillMap.values()).sort((a, b) => {
     const r = (rankSource[a.source] ?? 9) - (rankSource[b.source] ?? 9);
@@ -3062,48 +3254,52 @@ export function collectOverviewSnapshot(payload = {}, opts = {}) {
       agentItems.push({ name, path: path.join(dirPath, ent.name), source });
     }
   };
-  collectAgentMd(agentsDir, 'user');
-  for (const pl of enabledPlugins) {
-    collectAgentMd(path.join(pl.dir, 'agents'), 'plugin');
+  for (const { src } of sourcePlugins) collectAgentMd(src.agentsDir, 'user');
+  for (const { enabledPlugins } of sourcePlugins) {
+    for (const pl of enabledPlugins) {
+      collectAgentMd(path.join(pl.dir, 'agents'), 'plugin');
+    }
   }
   const agents = { total: agentItems.length, items: agentItems };
 
   /* 4. Connectors (never expose env/args/headers/command/tokens) */
   const connectors = [];
   const seenConnIds = new Set();
-  const rootMcpPath = path.join(configDir, 'mcp_config.json');
-  const rootMcp = readJsonOrFallback(rootMcpPath, null);
-  if (rootMcp && typeof rootMcp.mcpServers === 'object' && rootMcp.mcpServers) {
-    for (const [id, def] of Object.entries(rootMcp.mcpServers)) {
-      if (!def || def.disabled === true || seenConnIds.has(id)) continue;
-      seenConnIds.add(id);
-      connectors.push({ id, name: prettifyConnectorName(id), kind: 'mcp', configPath: rootMcpPath });
-    }
-  }
-  for (const pl of enabledPlugins) {
-    const plMcpPath = path.join(pl.dir, 'mcp_config.json');
-    const plMcp = readJsonOrFallback(plMcpPath, null);
-    if (plMcp && typeof plMcp.mcpServers === 'object' && plMcp.mcpServers) {
-      for (const [id, def] of Object.entries(plMcp.mcpServers)) {
+  for (const { src, enabledPlugins } of sourcePlugins) {
+    const rootMcpPath = path.join(src.configDir, 'mcp_config.json');
+    const rootMcp = readJsonOrFallback(rootMcpPath, null);
+    if (rootMcp && typeof rootMcp.mcpServers === 'object' && rootMcp.mcpServers) {
+      for (const [id, def] of Object.entries(rootMcp.mcpServers)) {
         if (!def || def.disabled === true || seenConnIds.has(id)) continue;
         seenConnIds.add(id);
-        connectors.push({ id, name: prettifyConnectorName(id), kind: 'mcp', configPath: plMcpPath });
+        connectors.push({ id, name: prettifyConnectorName(id), kind: 'mcp', configPath: rootMcpPath });
       }
     }
-    const plJsonPath = path.join(pl.dir, 'plugin.json');
-    const plJson = readJsonOrFallback(plJsonPath, null);
-    const hasAuth = fs.existsSync(path.join(pl.dir, 'auth.json'));
-    const isExternalConnector = Boolean(
-      plJson && (pl.cfg.installedFrom || plJson.auth || plJson.cli || plJson.mcp || hasAuth)
-    );
-    if (isExternalConnector && !seenConnIds.has(pl.name)) {
-      seenConnIds.add(pl.name);
-      connectors.push({
-        id: pl.name,
-        name: String(plJson.displayName || plJson.name || prettifyConnectorName(pl.name)),
-        kind: 'plugin',
-        configPath: plJsonPath
-      });
+    for (const pl of enabledPlugins) {
+      const plMcpPath = path.join(pl.dir, 'mcp_config.json');
+      const plMcp = readJsonOrFallback(plMcpPath, null);
+      if (plMcp && typeof plMcp.mcpServers === 'object' && plMcp.mcpServers) {
+        for (const [id, def] of Object.entries(plMcp.mcpServers)) {
+          if (!def || def.disabled === true || seenConnIds.has(id)) continue;
+          seenConnIds.add(id);
+          connectors.push({ id, name: prettifyConnectorName(id), kind: 'mcp', configPath: plMcpPath });
+        }
+      }
+      const plJsonPath = path.join(pl.dir, 'plugin.json');
+      const plJson = readJsonOrFallback(plJsonPath, null);
+      const hasAuth = fs.existsSync(path.join(pl.dir, 'auth.json'));
+      const isExternalConnector = Boolean(
+        plJson && (pl.cfg.installedFrom || plJson.auth || plJson.cli || plJson.mcp || hasAuth)
+      );
+      if (isExternalConnector && !seenConnIds.has(pl.name)) {
+        seenConnIds.add(pl.name);
+        connectors.push({
+          id: pl.name,
+          name: String(plJson.displayName || plJson.name || prettifyConnectorName(pl.name)),
+          kind: 'plugin',
+          configPath: plJsonPath
+        });
+      }
     }
   }
 
@@ -3177,15 +3373,21 @@ async function handleProjectRpcRequest(rawPayload, callerEntry = null) {
         if (res.ok) contexts[raw] = res;
       }
       const projectMtimes = {};
+      const projectDirs = [NATIVE_PROJECTS_DIR, ...discoverWslGeminiDirs().map((g) => path.join(g, 'config', 'projects'))];
       for (const rawId of projectIds) {
         const id = String(rawId || '').trim();
         if (!id || !/^[a-zA-Z0-9._-]+$/.test(id)) continue;
-        const projFile = path.join(NATIVE_PROJECTS_DIR, `${id}.json`);
-        if (!isPathInsideDir(NATIVE_PROJECTS_DIR, projFile)) continue;
-        try {
-          const st = fs.statSync(projFile, { throwIfNoEntry: false });
-          if (st && st.isFile()) projectMtimes[id] = Math.floor(st.mtimeMs);
-        } catch {}
+        for (const projDir of projectDirs) {
+          const projFile = path.join(projDir, `${id}.json`);
+          if (!isPathInsideDir(projDir, projFile)) continue;
+          try {
+            const st = fs.statSync(projFile, { throwIfNoEntry: false });
+            if (st && st.isFile()) {
+              projectMtimes[id] = Math.floor(st.mtimeMs);
+              break;
+            }
+          } catch {}
+        }
       }
       return { reqId, result: { ok: true, contexts, projectMtimes } };
     }
@@ -3240,19 +3442,30 @@ async function handleProjectRpcRequest(rawPayload, callerEntry = null) {
       if (!rawTarget) return { reqId, result: { ok: false, error: 'missing_path' } };
       const absTarget = path.resolve(rawTarget);
       const explicitProj = resolveLocalProjectDir(payload?.dirPath);
-      const globalAgentsMd = path.join(HOME, '.gemini', 'AGENTS.md');
+      const globalAgentsFiles = [
+        path.join(HOME, '.gemini', 'AGENTS.md'),
+        ...discoverWslGeminiDirs().map((g) => path.join(g, 'AGENTS.md'))
+      ];
       const builtinRootDir = path.join(HOME, '.gemini', 'antigravity', 'builtin');
+      const wslRoots = [];
+      for (const g of discoverWslGeminiDirs()) {
+        const cfg = path.join(g, 'config');
+        wslRoots.push(path.join(cfg, 'skills'), path.join(cfg, 'agents'), path.join(g, 'antigravity', 'builtin'));
+        wslRoots.push(...getSafePluginDocRoots(cfg));
+      }
       const allowedRoots = [
         ...(explicitProj ? [explicitProj] : []),
         ...getRegisteredProjectDirs(),
         GLOBAL_SKILLS_DIR,
         GLOBAL_AGENTS_DIR,
         builtinRootDir,
-        ...getSafePluginDocRoots()
+        ...getSafePluginDocRoots(),
+        ...wslRoots
       ];
+      const normTarget = normalizePathForCompare(absTarget);
       const authorized =
-        absTarget === globalAgentsMd ||
-        allowedRoots.some((root) => absTarget === root || isPathInsideDir(root, absTarget));
+        globalAgentsFiles.some((f) => normalizePathForCompare(f) === normTarget) ||
+        allowedRoots.some((root) => normTarget === normalizePathForCompare(root) || isPathInsideDir(root, absTarget));
       if (!authorized) {
         return { reqId, result: { ok: false, error: 'path_outside_project' } };
       }
@@ -3481,7 +3694,12 @@ export async function attachTarget(page, endpoint, opts = {}) {
     if (!entry.hostConfirmed || !activeConfig.enabled || activeConfig.modules.metrics === false || page.type === 'iframe') return;
     const cid = cascadeId || entry.watchedCascadeId;
     if (!cid || !UUID_RE.test(cid)) return;
-    const payload = parseConversationMetrics(cid, entry.endpoint.conversationsDir);
+    const candidateConvDirs = [
+      entry.endpoint.conversationsDir,
+      ...(Array.isArray(entry.endpoint.extraConversationsDirs) ? entry.endpoint.extraConversationsDirs : []),
+      ...discoverWslConversationsDirs()
+    ];
+    const payload = parseConversationMetrics(cid, candidateConvDirs);
     if (!payload) return;
     if (payload.transientError) {
       if (force && payload.cachedPayload) {
