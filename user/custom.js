@@ -2648,7 +2648,7 @@
     'open', 'setIsOpen', 'customModels', 'supportsCustomModels', 'showCustomModelHeader', 'onAddCustomModel',
     'onEditCustomModel', 'bestOfNConfig', 'contextWindow', 'isModelListLoading', 'finalFocus', 'footerExtra',
     'orchestratorPick', 'children', 'groups', 'effortIndex', 'orchestratorPlanners', 'orchestratorPlannerIndex',
-    'orchestratorDefaultPlanner', 'orchestratorExecutors', 'lockedReason'
+    'orchestratorDefaultPlanner', 'orchestratorExecutors', 'lockedReason', 'tooltipNote'
   ]);
   let bypassNativeModelTriggerUntil = 0;
 
@@ -3580,8 +3580,20 @@
     const effDisabled = hasAdjustableEffort ? '' : ' data-disabled="true"';
     const moreSubActive = activeModelSubmenu === 'more' ? ' data-active-sub="true"' : '';
 
+    const rawTooltipNote = typeof api?.tooltipNote === 'string' ? api.tooltipNote.trim() : '';
+    const tooltipNoteText =
+      rawTooltipNote === 'Applies to /btw and messages sent after this turn'
+        ? L('将用于 /btw 及本轮之后的新消息', rawTooltipNote)
+        : rawTooltipNote === 'Applies to messages sent after this turn'
+          ? L('将用于本轮之后的新消息', rawTooltipNote)
+          : rawTooltipNote;
+    const tooltipNoteHtml = tooltipNoteText
+      ? `<div class="ag-cm-note" data-ag-cm-note="1">${escapeHtml(tooltipNoteText)}</div>`
+      : '';
+
     mainPop.innerHTML = `
       <div class="ag-cm-sec-hdr">${L('模型 · 本次会话', 'Models · This chat')}</div>
+      ${tooltipNoteHtml}
       <div>${primaryRowsHtml}</div>
       <div class="ag-cm-divider"></div>
       <button type="button" class="ag-cm-row" data-ag-cm-hover="${

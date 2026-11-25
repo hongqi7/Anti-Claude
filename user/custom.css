@@ -1662,6 +1662,22 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) :is(#ag-claude-model-popov
   color: #9A9994 !important;
 }
 
+.ag-cm-note {
+  margin: 0 6px 6px 6px !important;
+  padding: 5px 8px !important;
+  border-radius: 7px !important;
+  background-color: #F5F5F3 !important;
+  color: #6B6A66 !important;
+  font-size: 11.5px !important;
+  line-height: 1.4 !important;
+  white-space: normal !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-cm-note {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+  color: #A8A7A2 !important;
+}
+
 .ag-cm-divider {
   height: 1px !important;
   margin: 6px 6px !important;
