@@ -12764,6 +12764,7 @@
     context: true,
     quota: true,
     otherPools: true,
+    usage: true,
     sidechats: true,
     connectors: false,
     invMemory: false,
@@ -12789,6 +12790,9 @@
 
   const ovSnapshotCache = new Map(); // dirKey -> { ts, data }
   const ovSnapshotInFlight = new Map(); // dirKey -> Promise
+  let ovUsageCache = { ts: 0, data: null };
+  let ovUsageInFlight = null;
+  let ovUsagePartialTimer = 0;
   let ovLastQuotaAutoTryTs = 0;
   let ovQuotaSpinTimer = 0;
   let ovRefreshSpinUntil = 0;
@@ -12798,6 +12802,7 @@
 
   function invalidateOverviewSnapshotCache() {
     ovSnapshotCache.clear();
+    ovUsageCache = { ts: 0, data: null };
     ovWorkspaceMemo = { ts: 0, key: '', value: null };
     if (!disposed && FEAT.overviewPanel) {
       const sec = document.getElementById('ag-claude-ov-sections');
@@ -12809,7 +12814,8 @@
   function fmtOvTokens(n) {
     const v = Number(n) || 0;
     if (!Number.isFinite(v) || v <= 0) return '0';
-    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`;
+    if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2).replace(/\.?0+$/, '')}B`;
+    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
     if (v >= 1000) return fmtCompactTokens(v);
     return String(Math.round(v));
   }
@@ -12926,6 +12932,63 @@
       ovSnapshotInFlight.set(key, p);
     }
     return cached ? cached.data : null;
+  }
+
+  function ensureUsageSummary(force = false) {
+    if (typeof window.__agProjectCall !== 'function') return null;
+    const now = Date.now();
+    if (!force && ovUsageCache.data && !ovUsageCache.data.partial && now - ovUsageCache.ts < 20000) {
+      return ovUsageCache.data;
+    }
+    if (!ovUsageInFlight) {
+      const p = Promise.resolve(window.__agProjectCall('getUsageSummary', { days: 14, force: Boolean(force) }, 10000))
+        .then((res) => {
+          if (disposed || !res || !res.ok) return;
+          ovUsageCache = { ts: Date.now(), data: res };
+          if (FEAT.overviewPanel) renderOverviewPanel(false);
+          if (res.partial && isOverviewPanelVisible()) {
+            cancelLater(ovUsagePartialTimer);
+            ovUsagePartialTimer = later(() => {
+              ovUsagePartialTimer = 0;
+              if (!disposed && FEAT.overviewPanel && isOverviewPanelVisible()) {
+                ensureUsageSummary(true);
+              }
+            }, 900);
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          ovUsageInFlight = null;
+        });
+      ovUsageInFlight = p;
+    }
+    return ovUsageCache.data;
+  }
+
+  function onOverviewSectionsHover(e) {
+    if (disposed || !FEAT.overviewPanel) return;
+    const barCol = e.target && e.target.closest ? e.target.closest('.ag-ov-trend-col[data-tip]') : null;
+    if (!barCol) return;
+    const wrap = barCol.closest('.ag-ov-trend-wrap');
+    const meta = wrap && wrap.querySelector('.ag-ov-trend-meta');
+    if (meta) {
+      meta.textContent = barCol.getAttribute('data-tip') || meta.getAttribute('data-default') || '';
+      meta.setAttribute('data-hover', '1');
+    }
+  }
+
+  function onOverviewSectionsLeave(e) {
+    if (disposed || !FEAT.overviewPanel) return;
+    const barCol = e.target && e.target.closest ? e.target.closest('.ag-ov-trend-col[data-tip]') : null;
+    if (!barCol) return;
+    const rel = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('.ag-ov-trend-col[data-tip]') : null;
+    if (rel) return;
+    const wrap = barCol.closest('.ag-ov-trend-wrap');
+    const meta = wrap && wrap.querySelector('.ag-ov-trend-meta');
+    if (meta) {
+      meta.textContent = meta.getAttribute('data-default') || '';
+      meta.removeAttribute('data-hover');
+    }
   }
 
   function collectMergedSidechats(curCid, stats, summaries) {
@@ -13065,6 +13128,7 @@
 
     const ws = resolveActiveOverviewWorkspace(force);
     const snap = ensureOverviewSnapshot(ws.dirPath, false);
+    const usage = ensureUsageSummary(false);
     const curCid = ws.cid;
     const rawM = window.__ag_last_metrics;
     const hasCtx = Boolean(rawM && rawM.hasData && (!curCid || rawM.cascadeId === curCid) && rawM.stats);
@@ -13073,6 +13137,7 @@
     const paneRunning = isPaneCurrentlyRunning();
     if (wasOvPaneGenerating && !paneRunning) {
       scheduleAutoQuotaRefresh(500, 3000);
+      ensureUsageSummary(true);
     }
     wasOvPaneGenerating = paneRunning;
     const { preUsed, limitLabel, summaryLabel, summaryPct } = extractCompactLabels(latestCtxState, curCid);
@@ -13087,16 +13152,19 @@
       ? `${snap.workspace?.dirPath}|${snap.workspace?.git?.branch}:${snap.workspace?.git?.added}:${snap.workspace?.git?.deleted}:${snap.workspace?.git?.changedFiles}|r${snap.rules?.length}|s${snap.skills?.total}|a${snap.agents?.total}|c${snap.connectors?.length}`
       : 'nosnap';
     const ctxSig = stats
-      ? `${stats.ctx}/${stats.limit}|${stats.cached}|${stats.uncached}|${stats.lastCacheRate}|${stats.sessionCacheRate}|${stats.turns}/${stats.calls}|${stats.totalThink}|${stats.totalResp}|${compactStatus}|${paneRunning ? 1 : 0}|${summaryLabel}`
+      ? `${stats.ctx}/${stats.limit}|${stats.cached}|${stats.uncached}|${stats.lastCacheRate}|${stats.sessionCacheRate}|${stats.cacheCollapsed ? 1 : 0}|${stats.turns}/${stats.calls}|${stats.totalThink}|${stats.totalResp}|${compactStatus}|${paneRunning ? 1 : 0}|${summaryLabel}`
       : `noctx|${compactStatus}|${paneRunning ? 1 : 0}`;
     const quotaSig = `${cachedUserTierName}|${ovPrimaryIdx}|${curModelLabel}|m${minuteBucket}|${groups
       .map((g) => `${g.displayName}:${(g.buckets || []).map((b) => `${b.window}=${b.remaining?.value ?? b.remainingFraction}:${b.resetTime?.seconds ?? ''}`).join(',')}`)
       .join(';')}`;
+    const usageSig = usage && usage.today
+      ? `${usage.todayDate}|${usage.today.totalTokens}|${usage.today.cacheHitRate}|${usage.today.activeSessions}|${usage.totalWindowTokens}|${usage.partial ? 1 : 0}`
+      : 'nousage';
     const subSig = mergedChildren.map((c) => `${c.id}:${c.running ? 1 : 0}:${c.title}:${c.calls}`).join('|');
     const colSig = Object.keys(OV_DEFAULT_OPEN)
       .map((k) => (ovCollapseState[k] ? '1' : '0'))
       .join('');
-    const renderSig = `${FEAT.i18n ? 'zh' : 'en'}||${curCid}||${ws.dirPath}||${snapSig}||${ctxSig}||${quotaSig}||${subSig}||${colSig}`;
+    const renderSig = `${FEAT.i18n ? 'zh' : 'en'}||${curCid}||${ws.dirPath}||${snapSig}||${ctxSig}||${quotaSig}||${usageSig}||${subSig}||${colSig}`;
 
     if (!force && sectionsEl.getAttribute('data-render-sig') === renderSig) return;
     sectionsEl.setAttribute('data-render-sig', renderSig);
@@ -13262,7 +13330,11 @@
                       <div class="ag-ov-submetrics">
                         <div class="ag-ov-kv-row">
                           <span class="ag-ov-muted">${L('缓存命中率', 'Prompt cache')}</span>
-                          <span><strong class="ag-ov-blue-txt">${stats.lastCacheRate}%</strong> <span class="ag-ov-muted">${L('· 累计', '· avg')} ${stats.sessionCacheRate}%</span></span>
+                          <span class="ag-ov-cache-val">${
+                            stats.cacheCollapsed
+                              ? `<strong class="ag-ov-warn-txt">${stats.lastCacheRate}%</strong> <span class="ag-ov-cache-drop-pill" title="${escapeHtml(L(`本轮大上下文缓存命中骤降（当前 ${stats.lastCacheRate}% vs 会话均值 ${stats.sessionCacheRate}%），可能触发了前缀失效`, `Sharp cache drop on large prompt (${stats.lastCacheRate}% vs ${stats.sessionCacheRate}% avg); prompt prefix may have invalidated`))}">${L('缓存塌陷', 'Cache drop')}</span>`
+                              : `<strong class="ag-ov-blue-txt">${stats.lastCacheRate}%</strong> <span class="ag-ov-muted">${L('· 累计', '· avg')} ${stats.sessionCacheRate}%</span>`
+                          }</span>
                         </div>
                         <div class="ag-ov-kv-row">
                           <span class="ag-ov-muted">${L('累计输出', 'Output split')}</span>
@@ -13556,7 +13628,102 @@
         }
       </section>`;
 
-    sectionsEl.innerHTML = `${envCardHtml}${ctxCardHtml}${quotaCardHtml}${sidechatsCardHtml}${connectorsCardHtml}`;
+    /* ---- 3.5 Today Usage Summary & 14-Day Trend Card ---- */
+    let usageCardHtml = '';
+    {
+      const todayData = usage && usage.today ? usage.today : null;
+      const hist = usage && Array.isArray(usage.dailyHistory) ? usage.dailyHistory : [];
+      const todayTotText = todayData ? fmtOvTokens(todayData.totalTokens) : '—';
+      const hdrMeta = todayData
+        ? L(`今日 ${todayTotText}`, `Today ${todayTotText}`)
+        : L('统计中…', 'Loading…');
+      const total14dText = usage ? fmtOvTokens(usage.totalWindowTokens) : '0';
+      const trendDefaultMeta = usage && usage.partial
+        ? L(`合计 ${total14dText} · 同步中`, `${total14dText} · syncing`)
+        : L(`14日合计 ${total14dText}`, `14d ${total14dText}`);
+
+      let trendInnerHtml = '';
+      if (hist.length > 0) {
+        const maxTok = hist.reduce((m, d) => Math.max(m, Number(d.totalTokens) || 0), 0);
+        const barsHtml = hist
+          .map((d) => {
+            const tot = Number(d.totalTokens) || 0;
+            const hasVal = tot > 0 && maxTok > 0;
+            const hPct = hasVal ? Math.max(12, Math.round((tot / maxTok) * 100)) : 0;
+            const cls = d.isToday ? 'ag-ov-trend-bar is-today' : hasVal ? 'ag-ov-trend-bar' : 'ag-ov-trend-bar is-empty';
+            const tipShort = hasVal
+              ? L(
+                  `${d.label} · ${fmtOvTokens(tot)} · 缓存 ${d.cacheHitRate}% · ${d.activeSessions}会话`,
+                  `${d.label} · ${fmtOvTokens(tot)} · ${d.cacheHitRate}% · ${d.activeSessions}s`
+                )
+              : L(`${d.label} · 无消耗`, `${d.label} · 0`);
+            const tipFull = hasVal
+              ? L(
+                  `${d.date}\n总计 ${fmtOvTokens(tot)}（输入 ${fmtOvTokens(d.inputTokens)} · 缓存 ${fmtOvTokens(d.cacheReadTokens)} · 输出 ${fmtOvTokens(d.outputTokens)}）\n缓存命中 ${d.cacheHitRate}% · ${d.activeSessions} 个会话 · ${d.calls} 次调用`,
+                  `${d.date}\nTotal ${fmtOvTokens(tot)} (In ${fmtOvTokens(d.inputTokens)} · Cache ${fmtOvTokens(d.cacheReadTokens)} · Out ${fmtOvTokens(d.outputTokens)})\nCache ${d.cacheHitRate}% · ${d.activeSessions} sessions · ${d.calls} calls`
+                )
+              : `${d.date}: 0`;
+            return `<div class="ag-ov-trend-col" data-tip="${escapeHtml(tipShort)}" title="${escapeHtml(tipFull)}"><span class="${cls}" style="height:${hasVal ? `${hPct}%` : '2px'}"></span></div>`;
+          })
+          .join('');
+        const firstLbl = hist[0] ? hist[0].label : '';
+        const midLbl = hist[Math.floor(hist.length / 2)] ? hist[Math.floor(hist.length / 2)].label : '';
+        trendInnerHtml = `
+          <div class="ag-ov-trend-wrap">
+            <div class="ag-ov-trend-hdr">
+              <span class="ag-ov-muted">${L('近 14 天趋势', '14-day trend')}</span>
+              <span class="ag-ov-trend-meta ag-ov-tabular" data-default="${escapeHtml(trendDefaultMeta)}">${escapeHtml(trendDefaultMeta)}</span>
+            </div>
+            <div class="ag-ov-trend-bars">${barsHtml}</div>
+            <div class="ag-ov-trend-axis ag-ov-tabular">
+              <span>${escapeHtml(firstLbl)}</span>
+              <span>${escapeHtml(midLbl)}</span>
+              <span>${L('今天', 'Today')}</span>
+            </div>
+          </div>`;
+      }
+
+      const todayTip = todayData
+        ? L(
+            `输入 ${fmtOvTokens(todayData.inputTokens)} · 缓存读取 ${fmtOvTokens(todayData.cacheReadTokens)} · 输出 ${fmtOvTokens(todayData.outputTokens)}`,
+            `In ${fmtOvTokens(todayData.inputTokens)} · Cache ${fmtOvTokens(todayData.cacheReadTokens)} · Out ${fmtOvTokens(todayData.outputTokens)}`
+          )
+        : '';
+
+      usageCardHtml = `
+        <section class="ag-ov-card" data-ov-card="usage">
+          <div class="ag-ov-card-hdr">
+            <button type="button" class="ag-ov-hdr-toggle" data-ag-ov-collapse="usage">
+              ${buildOvChevronSvg(ovCollapseState.usage)}
+              <span>${L('用量统计', 'Usage')}</span>
+            </button>
+            <span class="ag-ov-muted ag-ov-tabular">${escapeHtml(hdrMeta)}</span>
+          </div>
+          ${
+            ovCollapseState.usage
+              ? `<div class="ag-ov-card-body">
+                  ${
+                    todayData
+                      ? `<div class="ag-ov-usage-rows">
+                          <div class="ag-ov-kv-row" title="${escapeHtml(todayTip)}">
+                            <span class="ag-ov-muted">${L('今日总 Token', 'Today tokens')}</span>
+                            <span class="ag-ov-tabular ag-ov-usage-strong">${escapeHtml(todayTotText)}</span>
+                          </div>
+                          <div class="ag-ov-kv-row">
+                            <span class="ag-ov-muted">${L('今日缓存命中', 'Today cache')}</span>
+                            <span class="ag-ov-tabular"><strong class="ag-ov-blue-txt">${todayData.cacheHitRate}%</strong> <span class="ag-ov-muted">${L(`· ${todayData.activeSessions} 个会话`, `· ${todayData.activeSessions} chats`)}</span></span>
+                          </div>
+                        </div>
+                        ${trendInnerHtml}`
+                      : `<div class="ag-ov-empty-inline">${L('正在汇总本地近 14 天用量…', 'Loading 14-day local usage…')}</div>`
+                  }
+                </div>`
+              : ''
+          }
+        </section>`;
+    }
+
+    sectionsEl.innerHTML = `${envCardHtml}${ctxCardHtml}${quotaCardHtml}${usageCardHtml}${sidechatsCardHtml}${connectorsCardHtml}`;
   }
 
   function isNativeArtifactOverviewBlock(el) {
@@ -13653,6 +13820,8 @@
       sectionsEl.id = 'ag-claude-ov-sections';
       sectionsEl.setAttribute('data-ag-i18n-ignore', '1');
       sectionsEl.addEventListener('click', onOverviewSectionsClick);
+      sectionsEl.addEventListener('mouseover', onOverviewSectionsHover);
+      sectionsEl.addEventListener('mouseout', onOverviewSectionsLeave);
       scrollBody.appendChild(sectionsEl);
     }
 
@@ -13673,8 +13842,13 @@
       cancelLater(ovQuotaSpinTimer);
       ovQuotaSpinTimer = 0;
     }
+    if (ovUsagePartialTimer) {
+      cancelLater(ovUsagePartialTimer);
+      ovUsagePartialTimer = 0;
+    }
     ovRefreshSpinUntil = 0;
     ovSnapshotCache.clear();
+    ovUsageCache = { ts: 0, data: null };
     ovWorkspaceMemo = { ts: 0, key: '', value: null };
     ovCompactMemo = { ts: 0, key: '', status: 'idle' };
     const sectionsEl = document.getElementById('ag-claude-ov-sections');

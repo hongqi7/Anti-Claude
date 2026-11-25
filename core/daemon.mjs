@@ -1348,7 +1348,7 @@ function readSubagentSummaries(descendantIds, conversationsDir) {
   }
 }
 
-function parseConversationMetrics(cascadeId, conversationsDir) {
+export function parseConversationMetrics(cascadeId, conversationsDir) {
   if (!DatabaseSync || !cascadeId || !UUID_RE.test(cascadeId) || !conversationsDir) return null;
   const dbPath = path.join(conversationsDir, `${cascadeId}.db`);
   const statInfo = getDbStatByPath(dbPath);
@@ -1460,6 +1460,9 @@ function parseConversationMetrics(cascadeId, conversationsDir) {
     const ctxClass = ctxPct >= 90 ? 'ag-ctx-crit' : ctxPct >= 75 ? 'ag-ctx-warn' : 'ag-ctx-ok';
     const lastCacheRate = last.ctx > 0 ? ((last.cacheRead / last.ctx) * 100).toFixed(1) : '0.0';
     const sessionCacheRate = totalIn + totalCache > 0 ? ((totalCache / (totalIn + totalCache)) * 100).toFixed(1) : '0.0';
+    const lastCacheRateNum = Number(lastCacheRate);
+    const sessionCacheRateNum = Number(sessionCacheRate);
+    const cacheCollapsed = Boolean(sessionCacheRateNum >= 65 && last.ctx >= 30000 && lastCacheRateNum < 35);
     const remainCtx = Math.max(0, contextLimitTokens - last.ctx);
 
     const subInlineHtml =
@@ -1526,8 +1529,9 @@ function parseConversationMetrics(cascadeId, conversationsDir) {
       limitStr,
       remain: remainCtx,
       pct: ctxPct,
-      lastCacheRate: Number(lastCacheRate),
-      sessionCacheRate: Number(sessionCacheRate),
+      lastCacheRate: lastCacheRateNum,
+      sessionCacheRate: sessionCacheRateNum,
+      cacheCollapsed,
       turns: dbRes.userStepsCount,
       calls: valid.length,
       totalThink,
@@ -3110,6 +3114,263 @@ export function collectOverviewSnapshot(payload = {}, opts = {}) {
   return { ok: true, workspace, rules, skills, agents, connectors };
 }
 
+const USAGE_LEDGER_CACHE_FILE = path.join(STATE_DIR, 'usage-ledger-cache.json');
+let usageLedgerMem = null; // { cachePath, entries: Map<dbPath, { sig, mtimeMs, byDay }> }
+let usageSummaryMemo = { at: 0, key: '', data: null };
+const usageReadFailUntil = new Map(); // dbPath -> retryAfterMs
+
+function formatLocalDateKey(ms) {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function extractStepCreatedSec(metaBuf) {
+  if (!(metaBuf instanceof Uint8Array) || !metaBuf.length) return 0;
+  try {
+    const meta = parseProto(metaBuf);
+    for (const f of [1, 6, 7, 8]) {
+      const tsRaw = meta.get(f);
+      if (tsRaw instanceof Uint8Array && tsRaw.length) {
+        const tsMap = parseProto(tsRaw);
+        const sec = tsMap.get(1) || 0;
+        if (sec >= 1600000000 && sec <= 2200000000) return sec;
+      }
+    }
+  } catch {}
+  return 0;
+}
+
+function loadUsageLedgerStore(cacheFile) {
+  if (usageLedgerMem && usageLedgerMem.cachePath === cacheFile) return usageLedgerMem;
+  const entries = new Map();
+  const raw = readJsonOrFallback(cacheFile, null);
+  if (raw && raw.schema === 1 && raw.files && typeof raw.files === 'object') {
+    for (const [fp, val] of Object.entries(raw.files)) {
+      if (val && typeof val.sig === 'string' && val.byDay && typeof val.byDay === 'object') {
+        entries.set(fp, { sig: val.sig, mtimeMs: Number(val.mtimeMs) || 0, byDay: val.byDay });
+      }
+    }
+  }
+  usageLedgerMem = { cachePath: cacheFile, entries };
+  return usageLedgerMem;
+}
+
+function saveUsageLedgerStore(store) {
+  const tmp = `${store.cachePath}.tmp.${process.pid}`;
+  try {
+    fs.mkdirSync(path.dirname(store.cachePath), { recursive: true });
+    const files = {};
+    for (const [fp, val] of store.entries.entries()) {
+      files[fp] = val;
+    }
+    fs.writeFileSync(tmp, JSON.stringify({ schema: 1, updatedAt: Date.now(), files }), 'utf8');
+    fs.renameSync(tmp, store.cachePath);
+  } catch {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+  }
+}
+
+function readDbDailyUsage(dbPath, fallbackMtimeMs, cutoffDateKey) {
+  return withReadOnlyDb(dbPath, 60, (db) => {
+    const genRows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC').all();
+    if (!genRows.length) return {};
+    let stepDays = [];
+    try {
+      const stepRows = db.prepare('SELECT metadata FROM steps WHERE step_type = 15 ORDER BY idx ASC').all();
+      stepDays = stepRows.map((r) => {
+        const sec = extractStepCreatedSec(r.metadata);
+        return sec > 0 ? formatLocalDateKey(sec * 1000) : '';
+      });
+    } catch {}
+    const fallbackDay = formatLocalDateKey(fallbackMtimeMs || Date.now());
+    const lastKnownDay = stepDays.length ? stepDays[stepDays.length - 1] || fallbackDay : fallbackDay;
+    const byDay = {};
+    for (let i = 0; i < genRows.length; i++) {
+      const p = parseGenMetadataRow(genRows[i]);
+      const tot = p.inTok + p.cacheRead + p.outTok;
+      if (tot <= 0) continue;
+      const dayKey = (i < stepDays.length && stepDays[i]) || lastKnownDay;
+      if (dayKey < cutoffDateKey) continue;
+      let b = byDay[dayKey];
+      if (!b) {
+        b = { input: 0, cache: 0, output: 0, calls: 0 };
+        byDay[dayKey] = b;
+      }
+      b.input += p.inTok;
+      b.cache += p.cacheRead;
+      b.output += p.outTok;
+      b.calls += 1;
+    }
+    return byDay;
+  });
+}
+
+export function collectUsageSummary(opts = {}) {
+  if (!DatabaseSync) {
+    return { ok: false, error: 'sqlite_unavailable' };
+  }
+  const days = Math.max(7, Math.min(31, Number(opts.days) || 14));
+  const nowMs = Number(opts.nowMs) > 0 ? Number(opts.nowMs) : Date.now();
+  const explicitDirs = Array.isArray(opts.conversationsDirs);
+  const convDirs = explicitDirs
+    ? opts.conversationsDirs.filter((d) => typeof d === 'string' && d.trim())
+    : Array.from(
+        new Set([
+          path.join(HOME, '.gemini', 'antigravity', 'conversations'),
+          ...discoverEndpoints()
+            .map((ep) => ep && ep.conversationsDir)
+            .filter((d) => typeof d === 'string' && d.trim())
+        ])
+      );
+  const cacheFile = opts.cacheFile ? path.resolve(opts.cacheFile) : USAGE_LEDGER_CACHE_FILE;
+  const memoKey = `${days}|${cacheFile}|${convDirs.join('|')}`;
+  if (!opts.force && !explicitDirs && usageSummaryMemo.data && usageSummaryMemo.key === memoKey && !usageSummaryMemo.data.partial && nowMs - usageSummaryMemo.at < 15000) {
+    return usageSummaryMemo.data;
+  }
+
+  const todayDateObj = new Date(nowMs);
+  todayDateObj.setHours(0, 0, 0, 0);
+  const windowDates = [];
+  for (let offset = days - 1; offset >= 0; offset--) {
+    const d = new Date(todayDateObj.getTime() - offset * 86400000);
+    windowDates.push(formatLocalDateKey(d.getTime()));
+  }
+  const todayKey = windowDates[windowDates.length - 1];
+  const cutoffDateKey = formatLocalDateKey(todayDateObj.getTime() - (days + 2) * 86400000);
+  const cutoffMtimeMs = todayDateObj.getTime() - (days + 2) * 86400000;
+
+  const store = loadUsageLedgerStore(cacheFile);
+  const seenDirs = new Set();
+  const discovered = [];
+  const livePaths = new Set();
+
+  for (const dir of convDirs) {
+    const normDir = normalizePathForCompare(dir);
+    if (seenDirs.has(normDir)) continue;
+    seenDirs.add(normDir);
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const unc = isUncPath(dir);
+    for (const name of names) {
+      if (!DB_FILE_RE.test(name)) continue;
+      const dbPath = path.join(dir, name);
+      const info = getDbStatByPath(dbPath);
+      if (!info) continue;
+      livePaths.add(dbPath);
+      if (info.mtimeMs < cutoffMtimeMs) continue;
+      discovered.push({ dbPath, info, unc });
+    }
+  }
+
+  // Sort newest first so today and recent days populate immediately on cold start
+  discovered.sort((a, b) => b.info.mtimeMs - a.info.mtimeMs);
+
+  let dirty = false;
+  let uncachedScanned = 0;
+  let remainingUncached = 0;
+  const maxBatchDefault = discovered.some((x) => x.unc) ? 8 : 40;
+  const maxBatch = Number(opts.maxUncachedBatch) > 0 ? Number(opts.maxUncachedBatch) : maxBatchDefault;
+
+  for (const item of discovered) {
+    const existing = store.entries.get(item.dbPath);
+    if (existing && existing.sig === item.info.sig) continue;
+    const retryAfter = usageReadFailUntil.get(item.dbPath) || 0;
+    if (retryAfter > nowMs) continue;
+    if (uncachedScanned >= maxBatch) {
+      remainingUncached += 1;
+      continue;
+    }
+    uncachedScanned += 1;
+    try {
+      const byDay = readDbDailyUsage(item.dbPath, item.info.mtimeMs, cutoffDateKey);
+      store.entries.set(item.dbPath, { sig: item.info.sig, mtimeMs: item.info.mtimeMs, byDay });
+      usageReadFailUntil.delete(item.dbPath);
+      dirty = true;
+    } catch {
+      // Back off failed/corrupt DB for 60s to prevent infinite partial polling; keep previous cached data if any
+      usageReadFailUntil.set(item.dbPath, nowMs + 60000);
+    }
+  }
+
+  // Prune deleted or very stale cache entries
+  for (const [fp, val] of Array.from(store.entries.entries())) {
+    if (!livePaths.has(fp) && val.mtimeMs < cutoffMtimeMs) {
+      store.entries.delete(fp);
+      dirty = true;
+    }
+  }
+  if (dirty) saveUsageLedgerStore(store);
+
+  const dayAgg = new Map();
+  for (const key of windowDates) {
+    dayAgg.set(key, { input: 0, cache: 0, output: 0, calls: 0, sessions: 0 });
+  }
+  for (const item of discovered) {
+    const entry = store.entries.get(item.dbPath);
+    if (!entry || !entry.byDay) continue;
+    for (const [dayKey, vals] of Object.entries(entry.byDay)) {
+      const bucket = dayAgg.get(dayKey);
+      if (!bucket || !vals) continue;
+      const inp = Number(vals.input) || 0;
+      const cac = Number(vals.cache) || 0;
+      const out = Number(vals.output) || 0;
+      const calls = Number(vals.calls) || 0;
+      if (inp + cac + out <= 0) continue;
+      bucket.input += inp;
+      bucket.cache += cac;
+      bucket.output += out;
+      bucket.calls += calls;
+      bucket.sessions += 1;
+    }
+  }
+
+  let totalWindowTokens = 0;
+  const dailyHistory = windowDates.map((dateKey) => {
+    const b = dayAgg.get(dateKey);
+    const totalTokens = b.input + b.cache + b.output;
+    const totalPrompt = b.input + b.cache;
+    const cacheHitRate = totalPrompt > 0 ? Number(((b.cache / totalPrompt) * 100).toFixed(1)) : 0;
+    totalWindowTokens += totalTokens;
+    return {
+      date: dateKey,
+      label: dateKey.slice(5).replace('-', '/'),
+      totalTokens,
+      inputTokens: b.input,
+      cacheReadTokens: b.cache,
+      outputTokens: b.output,
+      cacheHitRate,
+      activeSessions: b.sessions,
+      calls: b.calls,
+      isToday: dateKey === todayKey
+    };
+  });
+
+  const today = dailyHistory[dailyHistory.length - 1];
+  const result = {
+    ok: true,
+    partial: remainingUncached > 0,
+    remainingCount: remainingUncached,
+    todayDate: todayKey,
+    today,
+    totalWindowTokens,
+    days,
+    dailyHistory
+  };
+  if (!explicitDirs) {
+    usageSummaryMemo = { at: nowMs, key: memoKey, data: result };
+  }
+  return result;
+}
+
 export async function collectOverviewSnapshotAsync(payload = {}, opts = {}) {
   const skipGit = Boolean(opts.skipGit);
   let absDir = '';
@@ -3233,6 +3494,11 @@ async function handleProjectRpcRequest(rawPayload, callerEntry = null) {
     }
     if (action === 'getOverviewSnapshot') {
       const result = await collectOverviewSnapshotAsync(payload);
+      return { reqId, result };
+    }
+    if (action === 'getUsageSummary') {
+      const days = Number(payload?.days) || 14;
+      const result = collectUsageSummary({ days, force: Boolean(payload?.force) });
       return { reqId, result };
     }
     if (action === 'revealFile') {
