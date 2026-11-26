@@ -4991,6 +4991,11 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cux-seg-btn[aria-check
   box-shadow: 0 0 0 2px rgba(47, 117, 195, 0.16) !important;
 }
 
+:is(html[data-ag-theme-mode="dark"] body, body.dark) #ag-claude-projects-view .ag-pd-composer-box[data-drag="true"] {
+  border-color: #5E9EFF !important;
+  box-shadow: 0 0 0 2px rgba(94, 158, 255, 0.24) !important;
+}
+
 #ag-claude-projects-view .ag-pd-media-strip {
   display: flex;
   flex-wrap: wrap !important;
