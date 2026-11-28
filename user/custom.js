@@ -2648,7 +2648,8 @@
     'open', 'setIsOpen', 'customModels', 'supportsCustomModels', 'showCustomModelHeader', 'onAddCustomModel',
     'onEditCustomModel', 'bestOfNConfig', 'contextWindow', 'isModelListLoading', 'finalFocus', 'footerExtra',
     'orchestratorPick', 'children', 'groups', 'effortIndex', 'orchestratorPlanners', 'orchestratorPlannerIndex',
-    'orchestratorDefaultPlanner', 'orchestratorExecutors', 'lockedReason', 'tooltipNote'
+    'orchestratorDefaultPlanner', 'orchestratorExecutors', 'lockedReason', 'tooltipNote',
+    'locked', 'hideThinkingEffort'
   ]);
   let bypassNativeModelTriggerUntil = 0;
 
@@ -2667,9 +2668,10 @@
   function nativeModelMenuGaps(api) {
     const gaps = { hard: [], soft: [] };
     if (!api || api.isReduxFallback) return gaps;
-    /* v2.35+ `lockedReason`: the official selector is deliberately pinned shut (e.g. managed/policy
-       environments). Mirroring upstream, our own popover must step aside so the locked state stays intact. */
-    if (api.lockedReason !== undefined && api.lockedReason !== null) gaps.hard.push('lockedReason');
+    /* v2.35+ `lockedReason` & v2.36+ `locked`: the official selector is deliberately pinned shut (e.g.
+       managed/policy environments or locked turns). Mirroring upstream, our own popover must step aside. */
+    if (api.locked === true) gaps.hard.push('locked');
+    else if (api.lockedReason !== undefined && api.lockedReason !== null) gaps.hard.push('lockedReason');
     if (api.bestOfNConfig && api.bestOfNConfig.isBestOfNEnabled === true) gaps.hard.push('bestOfN');
     if (api.footerExtra) gaps.soft.push('footerExtra');
     if (api.supportsCustomModels === true) gaps.soft.push('customModels');
@@ -3532,10 +3534,11 @@
     const cat = buildModelCatalog(api);
     currentCatalogSnapshot = cat;
 
+    const hideThinkingEffort = api.hideThinkingEffort === true;
     const multiEfforts = cat.activeFamily
       ? cat.activeFamily.variants.filter((v) => Boolean(v.effort))
       : [];
-    const hasAdjustableEffort = multiEfforts.length > 1;
+    const hasAdjustableEffort = !hideThinkingEffort && multiEfforts.length > 1;
     const curEffortText =
       cat.activeVariant && cat.activeVariant.effort
         ? displayEffortLabel(cat.activeVariant.effort)
@@ -3591,19 +3594,23 @@
       ? `<div class="ag-cm-note" data-ag-cm-note="1">${escapeHtml(tooltipNoteText)}</div>`
       : '';
 
+    const effortRowHtml = hideThinkingEffort
+      ? ''
+      : `<button type="button" class="ag-cm-row" data-ag-cm-hover="${
+          hasAdjustableEffort ? 'effort' : 'none'
+        }" data-ag-cm-subtrigger="effort"${effSubActive}${effDisabled}>
+        <span>${L('思考强度', 'Thinking effort')}</span>
+        <span class="ag-cm-right"><span>${escapeHtml(curEffortText)}</span>${
+          hasAdjustableEffort ? SVG_CM_CHEVRON : ''
+        }</span>
+      </button>`;
+
     mainPop.innerHTML = `
       <div class="ag-cm-sec-hdr">${L('模型 · 本次会话', 'Models · This chat')}</div>
       ${tooltipNoteHtml}
       <div>${primaryRowsHtml}</div>
       <div class="ag-cm-divider"></div>
-      <button type="button" class="ag-cm-row" data-ag-cm-hover="${
-        hasAdjustableEffort ? 'effort' : 'none'
-      }" data-ag-cm-subtrigger="effort"${effSubActive}${effDisabled}>
-        <span>${L('思考强度', 'Thinking effort')}</span>
-        <span class="ag-cm-right"><span>${escapeHtml(curEffortText)}</span>${
-          hasAdjustableEffort ? SVG_CM_CHEVRON : ''
-        }</span>
-      </button>
+      ${effortRowHtml}
       <button type="button" class="ag-cm-row" data-ag-cm-hover="more" data-ag-cm-subtrigger="more"${moreSubActive}>
         <span style="display:inline-flex;align-items:center;gap:6px;">
           <span>${L('更多模型', 'More models')}</span>
@@ -3715,7 +3722,7 @@
 
       /* Level 3 popover: either Orchestrator planner thinking effort OR official whitelisted Executor picker */
       let triOpen = false;
-      if (activeModelTrimenu && activeModelTrimenu.kind === 'planner' && activeModelTrimenu.familyName) {
+      if (!hideThinkingEffort && activeModelTrimenu && activeModelTrimenu.kind === 'planner' && activeModelTrimenu.familyName) {
         const entry = orchEntries.find((x) => x.fam.baseName === activeModelTrimenu.familyName);
         const effs = entry ? entry.fam.variants.filter((v) => Boolean(v.effort)) : [];
         if (entry && effs.length > 1) {
